@@ -1086,11 +1086,11 @@ dir_is_empty() {
 # 创建安装目录，成功后目录路径放到 CREATED_DIR
 create_dir() {
     CREATED_DIR=""
-    local dir
+    local dir def="${1:-/root/mybot}"
     heading "创建安装目录"
-    echo "  ${DIM}绝对路径，例如 /root/mybot；不能直接用 /root、/opt 等系统目录${RESET}"
+    echo "  ${DIM}绝对路径；不能直接用 /root、/opt 等系统目录；直接回车使用默认值${RESET}"
     while true; do
-        rd dir "目录（直接回车取消）"
+        rd dir "目录" "$def"
         if [[ -z "$dir" ]]; then warn "已取消。"; return 1; fi
         dir="${dir%/}"
         if [[ "$dir" != /* ]]; then
@@ -1133,43 +1133,47 @@ menu_create_dir() {
     create_dir
 }
 
-# 选择一个空闲目录，结果放到 PICKED_DIR
+# 选择一个空闲目录，结果放到 PICKED_DIR；参数 1 = 默认目录（直接回车使用，不存在则创建）
 pick_dir() {
     PICKED_DIR=""
+    local def="${1:-/root/mybot}" i d u state sel
     list_dirs
-    if (( ${#DIRS[@]} == 0 )); then
-        warn "还没有安装目录，先创建一个。"
-        create_dir || return 1
-        PICKED_DIR="$CREATED_DIR"
-    else
-        local i d u state free=() sel def=""
+    echo "  ${DIM}直接回车 = 使用默认目录 ${def}${RESET}"
+    if (( ${#DIRS[@]} > 0 )); then
         for i in "${!DIRS[@]}"; do
             d="${DIRS[i]}"; u="$(dir_user "$d")"
             if [[ -n "$u" ]]; then state="已被「$u」使用"
-            elif dir_is_empty "$d"; then state="空闲"; free+=("$((i + 1))")
+            elif dir_is_empty "$d"; then state="空闲"
             else state="非空"; fi
             menu_item $((i + 1)) "$d" "$state"
         done
-        menu_item n "新建目录"
-        echo
-        (( ${#free[@]} == 1 )) && def="${free[0]}"
-        rd sel "请选择（直接回车取消）" "$def"
-        [[ -n "$sel" ]] || { warn "已取消。"; return 1; }
-        if [[ "$sel" =~ ^[Nn]$ ]]; then
-            create_dir || return 1
-            PICKED_DIR="$CREATED_DIR"
-        elif [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#DIRS[@]} )); then
-            PICKED_DIR="${DIRS[sel-1]}"
-        else
-            err "无效选择：$sel"; return 1
-        fi
+    fi
+    menu_item n "输入其他路径"
+    echo
+    rd sel "选择" "默认"
+    if [[ "$sel" == "默认" ]]; then
+        PICKED_DIR="${def%/}"
+        mkdir -p "$PICKED_DIR" || { err "创建失败：$PICKED_DIR"; return 1; }
+        mkdir -p "$CONF_DIR" && chmod 700 "$CONF_DIR"
+        grep -qxF -- "$PICKED_DIR" "$DIRS_FILE" 2>/dev/null || echo "$PICKED_DIR" >>"$DIRS_FILE"
+        log "使用目录：$PICKED_DIR"
+    elif [[ "$sel" =~ ^[Nn]$ ]]; then
+        create_dir "$def" || return 1
+        PICKED_DIR="$CREATED_DIR"
+    elif [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#DIRS[@]} )); then
+        PICKED_DIR="${DIRS[sel-1]}"
+    else
+        err "无效选择：$sel"; return 1
+    fi
+    if is_unsafe_dir "$PICKED_DIR"; then
+        err "不能使用系统目录 $PICKED_DIR"; return 1
     fi
     if [[ -n "$(dir_user "$PICKED_DIR")" ]]; then
         err "该目录已被机器人「$(dir_user "$PICKED_DIR")」使用。"
         return 1
     fi
     if ! dir_is_empty "$PICKED_DIR"; then
-        err "$PICKED_DIR 不是空目录，请选择空目录或新建一个。"
+        err "$PICKED_DIR 不是空目录，请换一个目录。"
         return 1
     fi
     mkdir -p "$PICKED_DIR"
@@ -1208,7 +1212,7 @@ add_bot() {
     done
 
     heading "[2/3] 安装目录"
-    pick_dir || return 1
+    pick_dir "/root/$name" || return 1
     local dir="$PICKED_DIR"
 
     heading "[3/3] 机器人仓库"
@@ -1466,7 +1470,7 @@ while true; do
     echo
     echo "  $(lab 目录)${#DIRS[@]} 个    $(lab 机器人)${#BOTS[@]} 个"
     echo
-    menu_item 1 "创建安装目录" "机器人代码放哪里"
+    menu_item 1 "创建安装目录" "默认 /root/mybot，回车即可"
     menu_item 2 "添加机器人" "仓库拉取→装依赖→密钥→启动自启"
     menu_item 3 "管理机器人" "启动 / 停止 / 自启 / 日志 / 卸载"
     menu_item 0 "退出"
