@@ -750,20 +750,8 @@ write_value() {
 }
 
 cfg_token() {
-    local mode="$1" file="$2" token
+    local mode="$1" file="$2" token name
     heading "写入机器人 Token"
-    [[ "$mode" == "py" ]] && suggest_vars "$file"
-    echo "  ${DIM}变量名是代码里读取 Token 的名字（不是 Token 本身），直接回车使用默认值${RESET}"
-    ask TOKEN_VAR "Token 变量名" "${TOKEN_VAR:-BOT_TOKEN}"
-    if ! valid_name "$TOKEN_VAR"; then
-        if [[ "$TOKEN_VAR" == *:* ]]; then
-            err "这看起来是 Token，不是变量名。变量名形如 BOT_TOKEN，Token 请在下一步输入。"
-        else
-            err "变量名不合法（只能含字母、数字、下划线，且不能以数字开头）。"
-        fi
-        TOKEN_VAR=""
-        return
-    fi
     rds token "请输入机器人 Token（输入不显示）"
     [[ -n "$token" ]] || { warn "已取消。"; return; }
 
@@ -771,27 +759,43 @@ cfg_token() {
         warn "这个 Token 看起来不像标准格式（数字:字符串）。"
         confirm "仍然写入？" || return
     fi
+
+    echo
+    [[ "$mode" == "py" ]] && suggest_vars "$file"
+    echo "  ${DIM}Token 会存入一个变量，名称需与代码里读取的一致；直接回车使用括号内的名称${RESET}"
+    ask name "变量名" "${TOKEN_VAR:-BOT_TOKEN}"
+    if ! valid_name "$name"; then
+        err "变量名不合法，应形如 BOT_TOKEN（只能含字母、数字、下划线，不能以数字开头）。"
+        return
+    fi
+    TOKEN_VAR="$name"
     echo "  将写入：$TOKEN_VAR = $(mask "$token")"
     write_value "$mode" "$file" "$TOKEN_VAR" str str "$token" && save_conf
 }
 
 cfg_ids() {
-    local mode="$1" file="$2" raw ids id
+    local mode="$1" file="$2" raw ids id name
     heading "写入管理员 / 用户 ID"
-    [[ "$mode" == "py" ]] && suggest_vars "$file"
-    echo "  ${DIM}变量名是代码里读取管理员 ID 的名字，直接回车使用默认值${RESET}"
-    ask ID_VAR "用户ID 变量名" "${ID_VAR:-ADMIN_IDS}"
-    if ! valid_name "$ID_VAR"; then
-        err "变量名不合法（只能含字母、数字、下划线，且不能以数字开头）。"
-        ID_VAR=""
-        return
-    fi
     rd raw "用户 ID（多个用空格或逗号分隔）"
     ids="$(normalize_ids "$raw")"
     [[ -n "$ids" ]] || { warn "已取消。"; return; }
     for id in $ids; do
         [[ "$id" =~ ^-?[0-9]+$ ]] || { err "ID 必须是数字：$id"; return; }
     done
+
+    echo
+    [[ "$mode" == "py" ]] && suggest_vars "$file"
+    echo "  ${DIM}ID 会存入一个变量，名称需与代码里读取的一致；直接回车使用括号内的名称${RESET}"
+    ask name "变量名" "${ID_VAR:-ADMIN_IDS}"
+    if ! valid_name "$name"; then
+        if [[ "$name" =~ ^[0-9,\ -]+$ ]]; then
+            err "这看起来是数字 ID，不是变量名。变量名应形如 ADMIN_IDS。"
+        else
+            err "变量名不合法，应形如 ADMIN_IDS（只能含字母、数字、下划线，不能以数字开头）。"
+        fi
+        return
+    fi
+    ID_VAR="$name"
     echo "  将写入：$ID_VAR = $ids"
 
     local fallback="list"
