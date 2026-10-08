@@ -85,22 +85,22 @@ menu_item() {
 
 # rd 变量名 "提示" [默认值]
 rd() {
-    local __v="$1" text="$2" def="${3:-}" ans
+    local __v="$1" text="$2" def="${3:-}" __ans
     if [[ -n "$def" ]]; then
-        read -r -p "  ${CYAN}▸${RESET} ${text} ${DIM}[${def}]${RESET}: " ans
-        ans="${ans:-$def}"
+        read -r -p "  ${CYAN}▸${RESET} ${text} ${DIM}[${def}]${RESET}: " __ans
+        __ans="${__ans:-$def}"
     else
-        read -r -p "  ${CYAN}▸${RESET} ${text}: " ans
+        read -r -p "  ${CYAN}▸${RESET} ${text}: " __ans
     fi
-    printf -v "$__v" '%s' "$ans"
+    printf -v "$__v" '%s' "$__ans"
 }
 
 # 隐藏输入
 rds() {
-    local __v="$1" text="$2" ans
-    read -r -s -p "  ${CYAN}▸${RESET} ${text}: " ans
+    local __v="$1" text="$2" __ans
+    read -r -s -p "  ${CYAN}▸${RESET} ${text}: " __ans
     echo
-    printf -v "$__v" '%s' "$ans"
+    printf -v "$__v" '%s' "$__ans"
 }
 
 ask() { rd "$@"; }
@@ -556,18 +556,187 @@ do_pull() {
 
 # ---------------------------------------------------------------- 2. 安装环境（不使用虚拟环境）
 
+# ---------------------------------------------------------------- 依赖自动检测
+
+# Python 侧检测脚本
+#   py_detect scan 目录          输出 PIP=缺少的pip包  BIN=缺少的系统工具
+#   py_detect pipname 模块 [目录] 输出模块对应的pip包名
+py_detect() {
+    python3 - "$@" <<'PY'
+import ast, importlib.util, os, re, shutil, sys
+
+PIPMAP = {
+    "telegram": "python-telegram-bot", "PIL": "Pillow", "yaml": "PyYAML",
+    "cv2": "opencv-python-headless", "bs4": "beautifulsoup4", "dotenv": "python-dotenv",
+    "sklearn": "scikit-learn", "Crypto": "pycryptodome", "Cryptodome": "pycryptodomex",
+    "dateutil": "python-dateutil", "serial": "pyserial", "OpenSSL": "pyOpenSSL",
+    "jwt": "PyJWT", "magic": "python-magic", "attr": "attrs", "MySQLdb": "mysqlclient",
+    "psycopg2": "psycopg2-binary", "socks": "PySocks", "nacl": "PyNaCl",
+    "websocket": "websocket-client", "git": "GitPython", "docx": "python-docx",
+    "pptx": "python-pptx", "skimage": "scikit-image", "zmq": "pyzmq", "usb": "pyusb",
+    "telebot": "pyTelegramBotAPI", "telethon": "Telethon", "fake_useragent": "fake-useragent",
+    "speedtest": "speedtest-cli", "ruamel": "ruamel.yaml", "Levenshtein": "python-Levenshtein",
+}
+WIN_ONLY = {"msvcrt", "winreg", "_winapi", "nt", "winsound", "_msi", "_winreg"}
+EXTRAS = {
+    "job-queue": (r"job_queue|JobQueue", "apscheduler"),
+    "rate-limiter": (r"AIORateLimiter|rate_limiter", "aiolimiter"),
+    "webhooks": (r"run_webhook|webhook_url", "tornado"),
+}
+KNOWN = {"traceroute", "tracepath", "mtr", "nmap", "ping", "ping6", "dig", "nslookup",
+         "host", "curl", "wget", "whois", "ss", "ip", "ffmpeg", "iperf3"}
+
+
+def gather(root):
+    files = []
+    base = root.rstrip(os.sep).count(os.sep)
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in {".git", "__pycache__", "venv", ".venv", "node_modules"}]
+        if dp.count(os.sep) - base >= 2:
+            dn[:] = []
+        for f in fn:
+            if f.endswith(".py"):
+                files.append(os.path.join(dp, f))
+    mods, local, text = set(), set(), ""
+    for f in files:
+        local.add(os.path.splitext(os.path.basename(f))[0])
+        try:
+            src = open(f, encoding="utf-8", errors="ignore").read()
+        except OSError:
+            continue
+        text += src + "\n"
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    mods.add(a.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                mods.add(node.module.split(".")[0])
+    try:
+        for d in os.listdir(root):
+            if os.path.isdir(os.path.join(root, d)):
+                local.add(d)
+    except OSError:
+        pass
+    return mods, local, text
+
+
+def exists(m):
+    try:
+        return importlib.util.find_spec(m) is not None
+    except (ImportError, ValueError, AttributeError):
+        return False
+
+
+def ptb_used(text):
+    return [(n, mod) for n, (pat, mod) in EXTRAS.items() if re.search(pat, text)]
+
+
+def ptb_spec(text):
+    names = [n for n, _ in ptb_used(text)]
+    return "python-telegram-bot" + ("[" + ",".join(names) + "]" if names else "")
+
+
+mode = sys.argv[1]
+
+if mode == "pipname":
+    name = sys.argv[2]
+    root = sys.argv[3] if len(sys.argv) > 3 else ""
+    if name == "telegram" and root:
+        print(ptb_spec(gather(root)[2]))
+    else:
+        print(PIPMAP.get(name, name))
+    sys.exit(0)
+
+root = sys.argv[2]
+mods, local, text = gather(root)
+stdlib = getattr(sys, "stdlib_module_names", set())
+
+pip = []
+for m in sorted(mods):
+    if m in local or m in stdlib or m in WIN_ONLY or m == "__future__":
+        continue
+    if exists(m):
+        continue
+    pip.append(PIPMAP.get(m, m))
+
+if "telegram" in mods:
+    used = ptb_used(text)
+    need = (not exists("telegram")) or any(not exists(mod) for _, mod in used)
+    pip = [p for p in pip if p != "python-telegram-bot"]
+    if need:
+        pip.insert(0, ptb_spec(text))
+
+tools = set(re.findall(
+    r"""(?:subprocess\.(?:run|Popen|check_output|check_call|call|getoutput|getstatusoutput)"""
+    r"""|create_subprocess_exec|create_subprocess_shell|shutil\.which|os\.system|os\.popen)"""
+    r"""\(\s*\[?\s*[fF]?["']\s*([A-Za-z0-9_.+-]+)""", text))
+tools |= set(re.findall(
+    r"""\[\s*[fF]?["'](traceroute|tracepath|mtr|nmap|ping6?|dig|nslookup|whois|iperf3|ffmpeg|curl|wget)["']\s*,""",
+    text))
+bins = sorted(t for t in tools if t in KNOWN and shutil.which(t) is None)
+
+print("PIP=" + " ".join(pip))
+print("BIN=" + " ".join(bins))
+PY
+}
+
+# 系统工具名 → 当前系统的软件包名
+bin_pkg() {
+    local apt="" rpm=""
+    case "$1" in
+        traceroute) apt=traceroute;      rpm=traceroute ;;
+        tracepath)  apt=iputils-tracepath; rpm=iputils ;;
+        mtr)        apt=mtr-tiny;        rpm=mtr ;;
+        nmap)       apt=nmap;            rpm=nmap ;;
+        ping|ping6) apt=iputils-ping;    rpm=iputils ;;
+        dig|nslookup|host) apt=dnsutils; rpm=bind-utils ;;
+        curl)       apt=curl;            rpm=curl ;;
+        wget)       apt=wget;            rpm=wget ;;
+        whois)      apt=whois;           rpm=whois ;;
+        ss|ip)      apt=iproute2;        rpm=iproute ;;
+        ffmpeg)     apt=ffmpeg;          rpm=ffmpeg ;;
+        iperf3)     apt=iperf3;          rpm=iperf3 ;;
+        *) return 1 ;;
+    esac
+    if command -v apt-get >/dev/null 2>&1; then echo "$apt"; else echo "$rpm"; fi
+}
+
+# 扫描机器人代码，自动安装缺少的系统工具和 Python 包
+deps_auto() {
+    local out pip_list bin_list t p arr=()
+    local pkgs=()
+    out="$(py_detect scan "$INSTALL_DIR" 2>/dev/null)" || { warn "依赖检测失败。"; return 1; }
+    pip_list="$(sed -n 's/^PIP=//p' <<< "$out")"
+    bin_list="$(sed -n 's/^BIN=//p' <<< "$out")"
+
+    if [[ -n "$bin_list" ]]; then
+        for t in $bin_list; do
+            p="$(bin_pkg "$t")" && pkgs+=("$p")
+        done
+        if (( ${#pkgs[@]} > 0 )); then
+            log "检测到需要系统工具：$bin_list，正在安装..."
+            pkg_install "${pkgs[@]}" || warn "部分系统工具安装失败，继续。"
+        fi
+    fi
+
+    if [[ -n "$pip_list" ]]; then
+        log "检测到需要 Python 包：$pip_list，正在安装..."
+        read -ra arr <<< "$pip_list"
+        pip_install "${arr[@]}" || { err "Python 包安装失败"; return 1; }
+    else
+        log "Python 依赖已满足。"
+    fi
+}
+
 do_deps() {
     heading "安装环境"
     if [[ ! -d "$INSTALL_DIR" ]]; then
         warn "目录不存在：$INSTALL_DIR，请先获取机器人代码。"
         return 1
-    fi
-
-    local extra
-    rd extra "额外系统软件包（空格分隔，如 traceroute nmap；留空跳过）"
-    if [[ -n "$extra" ]]; then
-        # shellcheck disable=SC2086
-        pkg_install $extra || warn "部分系统包安装失败，继续。"
     fi
 
     ensure_python || return 1
@@ -576,14 +745,10 @@ do_deps() {
         log "正在安装 requirements.txt 依赖（系统 Python）..."
         pip_install -r "$INSTALL_DIR/requirements.txt" || { err "依赖安装失败"; return 1; }
     else
-        warn "目录里没有 requirements.txt。"
-        local pkgs
-        rd pkgs "需要安装的 pip 包（空格分隔，如 python-telegram-bot requests；留空跳过）"
-        if [[ -n "$pkgs" ]]; then
-            # shellcheck disable=SC2086
-            pip_install $pkgs || { err "依赖安装失败"; return 1; }
-        fi
+        log "没有 requirements.txt，自动扫描代码检测依赖..."
     fi
+
+    deps_auto || return 1
     log "环境安装完成（python3：$(command -v python3)）"
 }
 
@@ -720,6 +885,79 @@ set_env_var() {
     log "已写入 $key 到 $(basename "$file")"
 }
 
+# 扫描代码里实际使用的 Token / 用户ID 变量名
+#   detect_vars 模式(py|env) 文件 → 输出 TOKEN=xxx  ID=xxx（没找到则为空）
+detect_vars() {
+    python3 - "$INSTALL_DIR" "$1" "$2" <<'PY' 2>/dev/null
+import ast, os, re, sys
+root, mode, target = sys.argv[1:4]
+files = []
+if mode == "py" and os.path.isfile(target):
+    files = [target]
+else:
+    base = root.rstrip(os.sep).count(os.sep)
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in {".git", "__pycache__", "venv", ".venv", "node_modules"}]
+        if dp.count(os.sep) - base >= 2:
+            dn[:] = []
+        files += [os.path.join(dp, f) for f in fn if f.endswith(".py")]
+
+NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+TOK = re.compile(r"token", re.I)
+IDS = re.compile(r"admin|owner|user_?ids?|^uids?$|chat_?ids?|allowed|whitelist", re.I)
+PREF_T = ["BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TOKEN", "API_TOKEN"]
+PREF_I = ["ADMIN_IDS", "ADMIN_ID", "OWNER_ID", "OWNER_IDS", "ADMIN_USER_IDS", "ALLOWED_USERS", "USER_IDS", "CHAT_ID"]
+
+found = {}   # name -> count
+def add(n):
+    found[n] = found.get(n, 0) + 1
+
+def is_env(node):
+    try:
+        d = ast.dump(node)
+    except Exception:
+        return False
+    return "environ" in d or "getenv" in d
+
+for f in files:
+    try:
+        tree = ast.parse(open(f, encoding="utf-8", errors="ignore").read())
+    except (SyntaxError, OSError):
+        continue
+    for node in ast.walk(tree):
+        if mode == "env":
+            if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant) \
+               and isinstance(node.args[0].value, str) and NAME.match(node.args[0].value) \
+               and isinstance(node.func, ast.Attribute) and node.func.attr in ("getenv", "get") \
+               and is_env(node.func):
+                add(node.args[0].value)
+            elif isinstance(node, ast.Subscript) and is_env(node.value):
+                sl = node.slice
+                if isinstance(sl, ast.Constant) and isinstance(sl.value, str) and NAME.match(sl.value):
+                    add(sl.value)
+        else:
+            tgt = val = None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                tgt, val = node.targets[0].id, node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+                tgt, val = node.target.id, node.value
+            if tgt and not is_env(val):
+                add(tgt)
+
+def pick(rx, pref, bad=None):
+    names = [n for n in found if rx.search(n) and not (bad and bad.search(n))]
+    for p in pref:
+        for n in names:
+            if n.upper() == p:
+                return n
+    names.sort(key=lambda n: (-found[n], n))
+    return names[0] if names else ""
+
+print("TOKEN=" + pick(TOK, PREF_T))
+print("ID=" + pick(IDS, PREF_I, TOK))
+PY
+}
+
 suggest_vars() {
     local file="$1" names
     names="$(grep -iE '^[[:space:]]*[A-Za-z_0-9]*(token|admin|owner|user_?id|uid|chat)[A-Za-z_0-9]*[[:space:]]*(:[^=]*)?=[^=]' "$file" 2>/dev/null |
@@ -761,9 +999,17 @@ cfg_token() {
     fi
 
     echo
-    [[ "$mode" == "py" ]] && suggest_vars "$file"
-    echo "  ${DIM}Token 会存入一个变量，名称需与代码里读取的一致；直接回车使用括号内的名称${RESET}"
-    ask name "变量名" "${TOKEN_VAR:-BOT_TOKEN}"
+    local det def
+    det="$(detect_vars "$mode" "$file" | sed -n 's/^TOKEN=//p')"
+    def="${det:-${TOKEN_VAR:-BOT_TOKEN}}"
+    if [[ -n "$det" ]]; then
+        echo "  ${GREEN}已从代码中扫描到 Token 变量：${det}${RESET}"
+    else
+        [[ "$mode" == "py" ]] && suggest_vars "$file"
+        echo "  ${DIM}没有扫描到明确的变量名，使用默认值${RESET}"
+    fi
+    echo "  ${DIM}直接回车使用括号内的名称${RESET}"
+    ask name "变量名" "$def"
     if ! valid_name "$name"; then
         err "变量名不合法，应形如 BOT_TOKEN（只能含字母、数字、下划线，不能以数字开头）。"
         return
@@ -784,9 +1030,17 @@ cfg_ids() {
     done
 
     echo
-    [[ "$mode" == "py" ]] && suggest_vars "$file"
-    echo "  ${DIM}ID 会存入一个变量，名称需与代码里读取的一致；直接回车使用括号内的名称${RESET}"
-    ask name "变量名" "${ID_VAR:-ADMIN_IDS}"
+    local det def
+    det="$(detect_vars "$mode" "$file" | sed -n 's/^ID=//p')"
+    def="${det:-${ID_VAR:-ADMIN_IDS}}"
+    if [[ -n "$det" ]]; then
+        echo "  ${GREEN}已从代码中扫描到用户ID变量：${det}${RESET}"
+    else
+        [[ "$mode" == "py" ]] && suggest_vars "$file"
+        echo "  ${DIM}没有扫描到明确的变量名，使用默认值${RESET}"
+    fi
+    echo "  ${DIM}直接回车使用括号内的名称${RESET}"
+    ask name "变量名" "$def"
     if ! valid_name "$name"; then
         if [[ "$name" =~ ^[0-9,\ -]+$ ]]; then
             err "这看起来是数字 ID，不是变量名。变量名应形如 ADMIN_IDS。"
@@ -896,8 +1150,12 @@ service_create() {
     ensure_main_py || return 1
     [[ -f "$INSTALL_DIR/$MAIN_PY" ]] || { err "主程序不存在：$INSTALL_DIR/$MAIN_PY"; return 1; }
 
+    ensure_python || return 1
     local py
     py="$(command -v python3)" || { err "没有找到 python3，请先安装环境。"; return 1; }
+
+    log "检查依赖..."
+    deps_auto || warn "部分依赖安装失败，仍会尝试启动。"
 
     cat >"/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
@@ -918,10 +1176,23 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-    systemctl restart "$SERVICE_NAME"
     save_conf
-    sleep 2
-    log "服务已创建并启动：${SERVICE_NAME}  $(svc_state "$SERVICE_NAME")  已设置开机自启"
+
+    # 启动；如果因缺少模块崩溃，自动补装后重试
+    local round mod pkg
+    for round in 1 2 3 4; do
+        systemctl restart "$SERVICE_NAME"
+        sleep 4
+        systemctl is-active --quiet "$SERVICE_NAME" && break
+        mod="$(journalctl -u "$SERVICE_NAME" -n 40 --no-pager 2>/dev/null |
+            grep -oE "No module named '[^']+'" | tail -1 | sed -E "s/No module named '([^'.]+).*/\1/")"
+        [[ -n "$mod" ]] || break
+        pkg="$(py_detect pipname "$mod" "$INSTALL_DIR")"
+        warn "启动时缺少模块 $mod，自动安装 $pkg 后重试..."
+        pip_install "$pkg" || break
+    done
+
+    log "服务已创建：${SERVICE_NAME}  $(svc_state "$SERVICE_NAME")  已设置开机自启"
     if ! systemctl is-active --quiet "$SERVICE_NAME"; then
         warn "服务未正常运行，最近日志："
         journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null || true
