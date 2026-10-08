@@ -46,7 +46,7 @@ from telegram.ext import (
 CONFIG_FILE = os.environ.get("NAV_BOT_CONFIG", "/root/nav_bot_config.json")
 CONFIG_TEMPLATE = {
     "bot_token": "",
-    "admin_ids": [1715835996],
+    "admin_ids": [],
     "globalping_token": "",
     "divider_len": 19,
     "abuseipdb_key": "",
@@ -7385,7 +7385,7 @@ async def update_callback(query, context):
         await edit_page(query, "⏪ 已恢复旧版本，机器人正在重启……")
         request_restart(context.application)
         return
-ABUSEIPDB_BUILTIN_KEY = "7576f4ce98b3c39e1a2e135a6deca0f65f300de033aee6ec411bf5096c0f008eb73028ff2e377435"
+ABUSEIPDB_BUILTIN_KEY = ""
 IPQ_KEYS = {
     "ipapi_is": os.environ.get("IPAPI_IS_KEY") or CONFIG.get("ipapi_is_key") or "",
     "proxycheck": os.environ.get("PROXYCHECK_KEY") or CONFIG.get("proxycheck_key") or "",
