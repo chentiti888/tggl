@@ -2,8 +2,8 @@
 set -uo pipefail
 
 # Telegram 机器人 安装管理工具
-# 功能：获取机器人代码（仓库拉取 / 本地上传）/ 安装环境 / 写入密钥与用户ID / 配置开机自启 / 一键部署 / 卸载
-# 说明：没有任何预设值，名称、目录、仓库地址、变量名、Token、ID 全部交互式输入；
+# 流程：创建安装目录 → 添加机器人（仓库拉取 → 自动装依赖 → 写入密钥/ID → 启动并开机自启）→ 管理（启动/停止/自启/日志/卸载）
+# 说明：名称、目录、仓库地址、Token、ID 全部交互式输入；
 #       不使用虚拟环境，依赖直接装到系统 python3。
 # 用法：sudo bash tg-bot-gl.sh [仓库地址]
 
@@ -335,171 +335,12 @@ ensure_main_py() {
     save_conf
 }
 
-# ---------------------------------------------------------------- 机器人选择 / 新增
-
-# 新增机器人向导：名称、目录、代码来源全部手动输入
-new_bot() {
-    local name dir src="" src_choice url="" branch=""
-
-    cls
-    banner "新增机器人" "共 3 步"
-
-    # 步骤 1
-    heading "[1/3] 机器人名称"
-    echo "  ${DIM}用作 systemd 服务名；仅限小写字母、数字、- 和 _，例如 navbot${RESET}"
-    while true; do
-        rd name "名称（直接回车取消）"
-        if [[ -z "$name" ]]; then warn "已取消。"; return 1; fi
-        if [[ ! "$name" =~ ^[a-z0-9_-]+$ ]]; then
-            err "名称不合法，请重新输入。"
-            continue
-        fi
-        if [[ -f "$CONF_DIR/$name.conf" ]]; then
-            err "已存在同名机器人：$name，请换一个。"
-            continue
-        fi
-        break
-    done
-
-    # 步骤 2
-    heading "[2/3] 安装目录"
-    echo "  ${DIM}绝对路径，例如 /root/$name；不能直接用 /root、/opt 等系统目录${RESET}"
-    while true; do
-        rd dir "目录（直接回车取消）"
-        if [[ -z "$dir" ]]; then warn "已取消。"; return 1; fi
-        dir="${dir%/}"
-        if [[ "$dir" != /* ]]; then
-            err "必须是绝对路径（以 / 开头）。"
-            continue
-        fi
-        if is_unsafe_dir "$dir"; then
-            err "不能直接使用系统目录 $dir，请使用其下的子目录，例如 $dir/$name"
-            continue
-        fi
-        break
-    done
-
-    # 步骤 3
-    heading "[3/3] 机器人代码来源"
-    if [[ -n "$NEW_URL" ]]; then
-        src="repo"
-        url="$NEW_URL"
-        echo "  已通过命令行指定仓库：$url"
-    else
-        menu_item 1 "从 GitHub 仓库拉取" "输入仓库地址，由脚本克隆"
-        menu_item 2 "本地上传" "你自己把代码传到安装目录"
-        echo
-        while true; do
-            rd src_choice "请选择（直接回车取消）"
-            case "$src_choice" in
-                "") warn "已取消。"; return 1 ;;
-                1) src="repo"; break ;;
-                2) src="local"; break ;;
-                *) err "请输入 1 或 2。" ;;
-            esac
-        done
-        if [[ "$src" == "repo" ]]; then
-            while true; do
-                rd url "仓库地址（如 https://github.com/用户/仓库.git；回车取消）"
-                if [[ -z "$url" ]]; then warn "已取消。"; return 1; fi
-                break
-            done
-        fi
-    fi
-    if [[ "$src" == "repo" ]]; then
-        rd branch "分支（留空=默认分支）"
-    fi
-
-    # 确认
-    heading "请确认"
-    echo "  $(lab 名称)$name"
-    echo "  $(lab 目录)$dir"
-    if [[ "$src" == "repo" ]]; then
-        echo "  $(lab 来源)仓库 $url"
-        echo "  $(lab 分支)${branch:-默认分支}"
-    else
-        echo "  $(lab 来源)本地上传"
-    fi
-    echo
-    confirm_y "确认创建？" || { warn "已取消。"; return 1; }
-
-    reset_defaults
-    BOT_NAME="$name"
-    INSTALL_DIR="$dir"
-    SERVICE_NAME="$name"
-    SOURCE="$src"
-    REPO_URL="$url"
-    BRANCH="$branch"
-    CONF_FILE="$CONF_DIR/$name.conf"
-    NEW_URL=""
-    save_conf
-    log "已新增机器人「$name」"
-    if [[ "$src" == "local" ]]; then
-        mkdir -p "$INSTALL_DIR"
-        log "请把机器人代码上传到：$INSTALL_DIR"
-        sleep 1
-    fi
-}
-
-# 选择已有机器人，或新增一个
-select_bot() {
-    local names=() f i sel info
-    if [[ -d "$CONF_DIR" ]]; then
-        for f in "$CONF_DIR"/*.conf; do
-            [[ -f "$f" ]] && names+=("$(basename "$f" .conf)")
-        done
-    fi
-
-    if (( ${#names[@]} == 0 )); then
-        cls
-        banner "Telegram Bot Manager" "服务器 IP: ${SERVER_IP:-未知}"
-        echo
-        echo "  欢迎使用 Telegram 机器人部署工具。"
-        echo "  ${DIM}一键完成：获取代码 → 安装环境 → 写入密钥 → 开机自启${RESET}"
-        echo "  ${DIM}首次使用，先新增一个机器人。${RESET}"
-        echo
-        pause
-        new_bot
-        return $?
-    fi
-
-    cls
-    banner "Telegram Bot Manager" "服务器 IP: ${SERVER_IP:-未知}"
-    heading "选择机器人"
-    for i in "${!names[@]}"; do
-        info="$( source "$CONF_DIR/${names[i]}.conf" 2>/dev/null
-                 printf '%s  %s' "$(svc_state "${SERVICE_NAME:-${names[i]}}")" "${DIM}${INSTALL_DIR}${RESET}" )"
-        printf '  %s) %s  %s\n' "${YELLOW}$((i + 1))${RESET}" "$(padr "${names[i]}" 16)" "$info"
-    done
-    printf '  %s) %s\n' "${YELLOW}n${RESET}" "新增机器人"
-    echo
-
-    local def=""
-    [[ -n "$NEW_URL" ]] && def="n"
-    rd sel "请选择" "$def"
-
-    if [[ "$sel" =~ ^[Nn]$ ]]; then
-        new_bot
-        return $?
-    fi
-    if [[ ! "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#names[@]} )); then
-        err "无效选择：$sel"
-        return 1
-    fi
-
-    reset_defaults
-    BOT_NAME="${names[sel-1]}"
-    CONF_FILE="$CONF_DIR/$BOT_NAME.conf"
-    load_conf
-    [[ -n "$SERVICE_NAME" ]] || SERVICE_NAME="$BOT_NAME"
-}
-
 # ---------------------------------------------------------------- 1. 拉取 / 更新仓库
 
 do_pull() {
     heading "拉取 / 更新仓库"
     if [[ -z "$REPO_URL" ]]; then
-        warn "该机器人目前是本地上传模式，没有仓库地址。"
+        warn "该机器人还没有设置仓库地址。"
         rd REPO_URL "请输入仓库地址（直接回车取消）"
         [[ -n "$REPO_URL" ]] || { echo "  已取消。"; return 1; }
         rd BRANCH "分支（留空=默认分支）"
@@ -1199,69 +1040,316 @@ EOF
     fi
 }
 
-service_menu() {
-    has_systemd || { err "系统没有 systemd。"; return 1; }
-    local c
-    while true; do
-        cls
-        banner "服务管理（开机自启）" "$BOT_NAME"
-        echo
-        echo "  $(lab 服务)${SERVICE_NAME}    $(svc_state "$SERVICE_NAME")"
-        echo "  $(lab 主程序)${MAIN_PY:-未选择}"
-        echo "  $(lab 自启)$(svc_enabled "$SERVICE_NAME")"
-        echo
-        menu_item 1 "创建 / 更新服务并启动" "含开机自启"
-        menu_item 2 "启动"
-        menu_item 3 "停止"
-        menu_item 4 "重启"
-        menu_item 5 "查看状态"
-        menu_item 6 "最近日志" "50 行"
-        menu_item 7 "实时日志" "Ctrl+C 退出"
-        menu_item 8 "删除服务"
-        menu_item 9 "重新选择主程序"
-        menu_item 0 "返回"
-        echo
-        rd c "请选择"
-        case "$c" in
-            1) service_create; pause ;;
-            2) systemctl start "$SERVICE_NAME" && log "已启动"; pause ;;
-            3) systemctl stop "$SERVICE_NAME" && log "已停止"; pause ;;
-            4) systemctl restart "$SERVICE_NAME" && log "已重启"; pause ;;
-            5) systemctl status "$SERVICE_NAME" --no-pager -l || true; pause ;;
-            6) journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true; pause ;;
-            7) trap ':' INT
-               journalctl -u "$SERVICE_NAME" -f -n 20 || true
-               trap - INT ;;
-            8) if confirm "确认删除服务 ${SERVICE_NAME}？"; then
-                   systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-                   rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
-                   systemctl daemon-reload
-                   log "服务已删除。"
-               fi
-               pause ;;
-            9) if choose_py "请选择机器人主程序"; then
-                   MAIN_PY="$CHOSEN_PY"
-                   save_conf
-                   log "主程序已设为：$MAIN_PY（需在菜单 1 更新服务后生效）"
-               fi
-               pause ;;
-            0) break ;;
-            *) warn "无效选择：$c"; sleep 1 ;;
-        esac
+# ---------------------------------------------------------------- 安装目录 / 机器人列表
+
+DIRS_FILE="$CONF_DIR/dirs.list"
+DIRS=()
+BOTS=()
+CREATED_DIR=""
+PICKED_DIR=""
+BOT_GONE=0
+
+list_dirs() {
+    DIRS=()
+    [[ -f "$DIRS_FILE" ]] && mapfile -t DIRS < <(awk 'NF && !seen[$0]++' "$DIRS_FILE")
+    return 0
+}
+
+list_bots() {
+    BOTS=()
+    local f
+    if [[ -d "$CONF_DIR" ]]; then
+        for f in "$CONF_DIR"/*.conf; do
+            [[ -f "$f" ]] && BOTS+=("$(basename "$f" .conf)")
+        done
+    fi
+    return 0
+}
+
+# 哪个机器人在用这个目录（输出机器人名，没有则为空）
+dir_user() {
+    local f
+    [[ -d "$CONF_DIR" ]] || return 0
+    for f in "$CONF_DIR"/*.conf; do
+        [[ -f "$f" ]] || continue
+        if ( INSTALL_DIR=""; source "$f" 2>/dev/null; [[ "$INSTALL_DIR" == "$1" ]] ); then
+            basename "$f" .conf
+            return 0
+        fi
     done
 }
 
-# ---------------------------------------------------------------- 5. 状态
+dir_is_empty() {
+    [[ ! -d "$1" || -z "$(ls -A "$1" 2>/dev/null)" ]]
+}
+
+# 创建安装目录，成功后目录路径放到 CREATED_DIR
+create_dir() {
+    CREATED_DIR=""
+    local dir
+    heading "创建安装目录"
+    echo "  ${DIM}绝对路径，例如 /root/mybot；不能直接用 /root、/opt 等系统目录${RESET}"
+    while true; do
+        rd dir "目录（直接回车取消）"
+        if [[ -z "$dir" ]]; then warn "已取消。"; return 1; fi
+        dir="${dir%/}"
+        if [[ "$dir" != /* ]]; then
+            err "必须是绝对路径（以 / 开头）。"
+            continue
+        fi
+        if is_unsafe_dir "$dir"; then
+            err "不能直接使用系统目录 $dir，请使用其下的子目录，例如 $dir/mybot"
+            continue
+        fi
+        break
+    done
+    if [[ -e "$dir" && ! -d "$dir" ]]; then
+        err "$dir 已存在且不是目录。"
+        return 1
+    fi
+    mkdir -p "$dir" || { err "创建失败：$dir"; return 1; }
+    mkdir -p "$CONF_DIR" && chmod 700 "$CONF_DIR"
+    grep -qxF -- "$dir" "$DIRS_FILE" 2>/dev/null || echo "$dir" >>"$DIRS_FILE"
+    CREATED_DIR="$dir"
+    log "目录已创建：$dir"
+}
+
+# 主菜单 1：创建安装目录
+menu_create_dir() {
+    cls
+    banner "创建安装目录" "机器人代码存放位置"
+    list_dirs
+    if (( ${#DIRS[@]} > 0 )); then
+        heading "已创建的目录"
+        local d u state
+        for d in "${DIRS[@]}"; do
+            u="$(dir_user "$d")"
+            if [[ -n "$u" ]]; then state="机器人：$u"
+            elif dir_is_empty "$d"; then state="空闲"
+            else state="非空"; fi
+            printf '  %s  %s\n' "$(padr "$d" 30)" "${DIM}${state}${RESET}"
+        done
+    fi
+    create_dir
+}
+
+# 选择一个空闲目录，结果放到 PICKED_DIR
+pick_dir() {
+    PICKED_DIR=""
+    list_dirs
+    if (( ${#DIRS[@]} == 0 )); then
+        warn "还没有安装目录，先创建一个。"
+        create_dir || return 1
+        PICKED_DIR="$CREATED_DIR"
+    else
+        local i d u state free=() sel def=""
+        for i in "${!DIRS[@]}"; do
+            d="${DIRS[i]}"; u="$(dir_user "$d")"
+            if [[ -n "$u" ]]; then state="已被「$u」使用"
+            elif dir_is_empty "$d"; then state="空闲"; free+=("$((i + 1))")
+            else state="非空"; fi
+            menu_item $((i + 1)) "$d" "$state"
+        done
+        menu_item n "新建目录"
+        echo
+        (( ${#free[@]} == 1 )) && def="${free[0]}"
+        rd sel "请选择（直接回车取消）" "$def"
+        [[ -n "$sel" ]] || { warn "已取消。"; return 1; }
+        if [[ "$sel" =~ ^[Nn]$ ]]; then
+            create_dir || return 1
+            PICKED_DIR="$CREATED_DIR"
+        elif [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#DIRS[@]} )); then
+            PICKED_DIR="${DIRS[sel-1]}"
+        else
+            err "无效选择：$sel"; return 1
+        fi
+    fi
+    if [[ -n "$(dir_user "$PICKED_DIR")" ]]; then
+        err "该目录已被机器人「$(dir_user "$PICKED_DIR")」使用。"
+        return 1
+    fi
+    if ! dir_is_empty "$PICKED_DIR"; then
+        err "$PICKED_DIR 不是空目录，请选择空目录或新建一个。"
+        return 1
+    fi
+    mkdir -p "$PICKED_DIR"
+}
+
+# ---------------------------------------------------------------- 添加机器人
+
+# 按代码决定写入方式：代码从环境变量读取就写 .env，否则写主程序里的变量
+quick_keys() {
+    local mode file
+    if [[ -n "$(detect_vars env "" | sed -n 's/^TOKEN=//p')" ]]; then
+        mode="env"; file="$INSTALL_DIR/.env"
+        echo "  ${DIM}代码通过环境变量读取密钥，将写入 .env（systemd 自动加载）${RESET}"
+    else
+        mode="py"; file="$INSTALL_DIR/$MAIN_PY"
+        echo "  ${DIM}代码里没有读取环境变量，将直接写入 ${MAIN_PY} 里的变量${RESET}"
+    fi
+    cfg_token "$mode" "$file"
+    cfg_ids "$mode" "$file"
+}
+
+add_bot() {
+    local name url branch
+
+    cls
+    banner "添加机器人" "仓库拉取 → 密钥 → 启动"
+
+    heading "[1/3] 机器人名称"
+    echo "  ${DIM}用作 systemd 服务名；仅限小写字母、数字、- 和 _，例如 navbot${RESET}"
+    while true; do
+        rd name "名称（直接回车取消）"
+        if [[ -z "$name" ]]; then warn "已取消。"; return 1; fi
+        if [[ ! "$name" =~ ^[a-z0-9_-]+$ ]]; then err "名称不合法，请重新输入。"; continue; fi
+        if [[ -f "$CONF_DIR/$name.conf" ]]; then err "已存在同名机器人：$name，请换一个。"; continue; fi
+        break
+    done
+
+    heading "[2/3] 安装目录"
+    pick_dir || return 1
+    local dir="$PICKED_DIR"
+
+    heading "[3/3] 机器人仓库"
+    while true; do
+        rd url "仓库地址（如 https://github.com/用户/仓库.git；回车取消）" "$NEW_URL"
+        if [[ -z "$url" ]]; then warn "已取消。"; return 1; fi
+        break
+    done
+    rd branch "分支（留空=默认分支）"
+
+    heading "请确认"
+    echo "  $(lab 名称)$name"
+    echo "  $(lab 目录)$dir"
+    echo "  $(lab 仓库)$url"
+    echo "  $(lab 分支)${branch:-默认分支}"
+    echo
+    confirm_y "确认添加并开始部署？" || { warn "已取消。"; return 1; }
+
+    reset_defaults
+    BOT_NAME="$name"
+    INSTALL_DIR="$dir"
+    SERVICE_NAME="$name"
+    SOURCE="repo"
+    REPO_URL="$url"
+    BRANCH="$branch"
+    CONF_FILE="$CONF_DIR/$name.conf"
+    NEW_URL=""
+    save_conf
+    log "已添加机器人「$name」"
+
+    heading "拉取代码"
+    do_pull || { warn "拉取失败。到「管理机器人」里选择它，可重新更新仓库。"; return 1; }
+
+    heading "安装环境（自动）"
+    do_deps || warn "环境安装有问题，稍后可在「管理机器人」里选「修复依赖」。"
+
+    heading "写入密钥 / 用户ID"
+    quick_keys
+
+    heading "启动机器人"
+    if confirm_y "现在启动并设置开机自启？"; then
+        service_create
+    else
+        echo "  已跳过，之后可在「管理机器人」里启动。"
+    fi
+}
+
+# ---------------------------------------------------------------- 管理机器人
+
+# 选一个已有机器人并载入配置
+pick_bot() {
+    list_bots
+    if (( ${#BOTS[@]} == 0 )); then
+        warn "还没有机器人，请先用主菜单 2 添加。"
+        return 1
+    fi
+    cls
+    banner "管理机器人" "选择一个"
+    heading "机器人列表"
+    local i info sel
+    for i in "${!BOTS[@]}"; do
+        info="$( source "$CONF_DIR/${BOTS[i]}.conf" 2>/dev/null
+                 printf '%s  %s' "$(svc_state "${SERVICE_NAME:-${BOTS[i]}}")" "${DIM}${INSTALL_DIR}${RESET}" )"
+        printf '  %s) %s  %s\n' "${YELLOW}$((i + 1))${RESET}" "$(padr "${BOTS[i]}" 16)" "$info"
+    done
+    echo
+    local def=""
+    (( ${#BOTS[@]} == 1 )) && def="1"
+    rd sel "请选择编号（直接回车取消）" "$def"
+    [[ -n "$sel" ]] || return 1
+    if [[ ! "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#BOTS[@]} )); then
+        err "无效选择：$sel"
+        return 1
+    fi
+    reset_defaults
+    BOT_NAME="${BOTS[sel-1]}"
+    CONF_FILE="$CONF_DIR/$BOT_NAME.conf"
+    load_conf
+    [[ -n "$SERVICE_NAME" ]] || SERVICE_NAME="$BOT_NAME"
+}
+
+unit_exists() {
+    [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]
+}
+
+bot_start() {
+    has_systemd || { err "系统没有 systemd。"; return 1; }
+    if ! unit_exists; then
+        log "服务还没创建，现在创建并启动..."
+        service_create
+        return
+    fi
+    systemctl start "$SERVICE_NAME"
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        log "已启动：${SERVICE_NAME}"
+    else
+        err "启动失败，最近日志："
+        journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null || true
+    fi
+}
+
+bot_stop() {
+    unit_exists || { warn "服务还没创建。"; return 1; }
+    systemctl stop "$SERVICE_NAME" && log "已停止：${SERVICE_NAME}（开机自启设置不变）"
+}
+
+bot_restart() {
+    unit_exists || { warn "服务还没创建，请先启动。"; return 1; }
+    systemctl restart "$SERVICE_NAME"
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        log "已重启：${SERVICE_NAME}"
+    else
+        err "重启后未运行，最近日志："
+        journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null || true
+    fi
+}
+
+bot_autostart() {
+    unit_exists || { warn "服务还没创建，请先启动机器人。"; return 1; }
+    if [[ "$(svc_enabled "$SERVICE_NAME")" == "已设置" ]]; then
+        systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 && log "已关闭开机自启（当前运行状态不变）"
+    else
+        systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 && log "已开启开机自启"
+    fi
+}
+
+# 更新仓库，服务在运行就询问是否重启
+bot_update() {
+    do_pull || return 1
+    if unit_exists && systemctl is-active --quiet "$SERVICE_NAME"; then
+        confirm_y "代码已更新，重启机器人使其生效？" && bot_restart
+    fi
+}
 
 do_show() {
     heading "当前状态"
     echo "  $(lab 机器人)$BOT_NAME"
-    if [[ "$SOURCE" == "repo" ]]; then
-        echo "  $(lab 来源)仓库 $REPO_URL"
-        echo "  $(lab 分支)${BRANCH:-（默认）}"
-    else
-        echo "  $(lab 来源)本地上传"
-    fi
+    echo "  $(lab 仓库)${REPO_URL:-（未设置）}"
+    echo "  $(lab 分支)${BRANCH:-（默认）}"
     echo "  $(lab 目录)$INSTALL_DIR $([[ -d "$INSTALL_DIR" ]] || echo '（不存在）')"
     echo "  $(lab 主程序)${MAIN_PY:-（未选择）}"
     echo "  $(lab Python)$(command -v python3 || echo 未安装)"
@@ -1274,28 +1362,6 @@ do_show() {
     if has_systemd; then
         echo "  $(lab 服务)${SERVICE_NAME}  $(svc_state "$SERVICE_NAME")  开机自启: $(svc_enabled "$SERVICE_NAME")"
     fi
-}
-
-# ---------------------------------------------------------------- 6/7. 一键部署与卸载
-
-do_all() {
-    heading "一键部署"
-    echo "  ${DIM}获取代码 → 安装环境 → 写入密钥/ID → 创建服务并开机自启${RESET}"
-    echo
-    if [[ "$SOURCE" == "repo" ]]; then
-        do_pull || return 1
-    else
-        ensure_main_py || return 1
-    fi
-    do_deps || return 1
-    echo
-    log "接下来写入 Token 和用户 ID（完成后选 0 返回继续）"
-    pause
-    do_config
-    cls
-    banner "一键部署" "$BOT_NAME"
-    echo
-    service_create
 }
 
 do_uninstall() {
@@ -1319,53 +1385,97 @@ do_uninstall() {
                 err "拒绝删除系统目录：$INSTALL_DIR"
             else
                 rm -rf -- "$INSTALL_DIR" && log "目录已删除。"
+                if [[ -f "$DIRS_FILE" ]]; then
+                    grep -vxF -- "$INSTALL_DIR" "$DIRS_FILE" >"$DIRS_FILE.tmp" || true
+                    mv "$DIRS_FILE.tmp" "$DIRS_FILE"
+                fi
             fi
         else
-            log "目录已保留。"
+            log "目录已保留（可在添加机器人时重新使用，需先清空）。"
         fi
     fi
 
     if confirm "是否同时从机器人列表中移除「${BOT_NAME}」？"; then
         rm -f "$CONF_FILE"
         CONF_FILE=""
+        BOT_GONE=1
         log "已移除。"
-        pause
-        select_bot || exit 0
     fi
+}
+
+bot_menu() {
+    local c
+    BOT_GONE=0
+    while (( ! BOT_GONE )); do
+        cls
+        banner "管理机器人" "$BOT_NAME"
+        echo
+        echo "  $(lab 状态)$(svc_state "$SERVICE_NAME")    $(lab 自启)$(svc_enabled "$SERVICE_NAME")"
+        echo "  $(lab 目录)${INSTALL_DIR}"
+        echo "  $(lab 主程序)${MAIN_PY:-未选择}"
+        echo "  $(lab 仓库)${REPO_URL:-未设置}"
+        echo
+        menu_item 1 "启动机器人" "没有服务时自动创建并设为开机自启"
+        menu_item 2 "停止机器人" "停止运行，不会自动重启"
+        menu_item 3 "重启机器人"
+        menu_item 4 "开机自启 开 / 关" "切换"
+        menu_item 5 "写入密钥 / 用户ID" "Token、管理员ID"
+        menu_item 6 "更新仓库代码" "有更新后可选重启"
+        menu_item 7 "修复依赖" "自动检测并安装缺少的包"
+        menu_item 8 "查看状态"
+        menu_item 9 "最近日志" "50 行"
+        menu_item a "实时日志" "Ctrl+C 退出"
+        menu_item m "重新选择主程序"
+        menu_item d "卸载此机器人" "删除服务 / 目录"
+        menu_item 0 "返回"
+        echo
+        rd c "请选择"
+        case "$c" in
+            1) bot_start; pause ;;
+            2) bot_stop; pause ;;
+            3) bot_restart; pause ;;
+            4) bot_autostart; pause ;;
+            5) do_config ;;
+            6) bot_update; pause ;;
+            7) do_deps; pause ;;
+            8) do_show; pause ;;
+            9) journalctl -u "$SERVICE_NAME" -n 50 --no-pager || true; pause ;;
+            a|A) trap ':' INT
+               journalctl -u "$SERVICE_NAME" -f -n 20 || true
+               trap - INT ;;
+            m|M) if choose_py "请选择机器人主程序"; then
+                   MAIN_PY="$CHOSEN_PY"
+                   save_conf
+                   log "主程序已设为：$MAIN_PY（需先停止再启动/重建服务后生效）"
+                   unit_exists && confirm_y "现在重建服务使其生效？" && service_create
+               fi
+               pause ;;
+            d|D) do_uninstall; pause ;;
+            0) break ;;
+            *) warn "无效选择：$c"; sleep 1 ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------- 主菜单
 
-select_bot || { pause; exit 1; }
-
 while true; do
+    list_dirs; list_bots
     cls
     banner "Telegram Bot Manager" "服务器 IP: ${SERVER_IP:-未知}"
     echo
-    echo "  $(lab 机器人)${BOLD}${BOT_NAME}${RESET}    $(lab 服务)$(svc_state "$SERVICE_NAME")"
-    echo "  $(lab 目录)${INSTALL_DIR}"
-    echo "  $(lab 主程序)${MAIN_PY:-未选择}    $(lab 来源)$([[ "$SOURCE" == "repo" ]] && echo 仓库 || echo 本地上传)"
+    echo "  $(lab 目录)${#DIRS[@]} 个    $(lab 机器人)${#BOTS[@]} 个"
     echo
-    menu_item 1 "拉取 / 更新仓库" "克隆或更新机器人代码"
-    menu_item 2 "安装环境" "python3 / pip / 依赖包"
-    menu_item 3 "写入密钥 / 用户ID" "Token、管理员ID"
-    menu_item 4 "服务管理（开机自启）" "创建 / 启停 / 日志"
-    menu_item 5 "查看当前状态" "详细信息"
-    menu_item 6 "一键部署" "代码→环境→密钥→自启"
-    menu_item 7 "卸载" "删除服务 / 目录"
-    menu_item 8 "切换 / 新增机器人" "多机器人管理"
+    menu_item 1 "创建安装目录" "机器人代码放哪里"
+    menu_item 2 "添加机器人" "仓库拉取→装依赖→密钥→启动自启"
+    menu_item 3 "管理机器人" "启动 / 停止 / 自启 / 日志 / 卸载"
     menu_item 0 "退出"
     echo
-    rd CHOICE "请选择"
+    rd CHOICE "请选择" "$([[ -n "$NEW_URL" ]] && echo 2)"
     case "$CHOICE" in
-        1) do_pull; pause ;;
-        2) do_deps; pause ;;
-        3) do_config ;;
-        4) service_menu ;;
-        5) do_show; pause ;;
-        6) do_all; pause ;;
-        7) do_uninstall; pause ;;
-        8) select_bot || pause ;;
+        1) menu_create_dir; pause ;;
+        2) add_bot; pause ;;
+        3) if pick_bot; then bot_menu; else pause; fi ;;
         0|q|Q) echo; echo "  已退出。"; exit 0 ;;
         *) warn "无效选择：$CHOICE"; sleep 1 ;;
     esac
