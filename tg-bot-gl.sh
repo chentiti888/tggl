@@ -753,8 +753,17 @@ cfg_token() {
     local mode="$1" file="$2" token
     heading "写入机器人 Token"
     [[ "$mode" == "py" ]] && suggest_vars "$file"
-    ask TOKEN_VAR "Token 变量名" "$TOKEN_VAR"
-    valid_name "$TOKEN_VAR" || { err "变量名不合法或为空。"; return; }
+    echo "  ${DIM}变量名是代码里读取 Token 的名字（不是 Token 本身），直接回车使用默认值${RESET}"
+    ask TOKEN_VAR "Token 变量名" "${TOKEN_VAR:-BOT_TOKEN}"
+    if ! valid_name "$TOKEN_VAR"; then
+        if [[ "$TOKEN_VAR" == *:* ]]; then
+            err "这看起来是 Token，不是变量名。变量名形如 BOT_TOKEN，Token 请在下一步输入。"
+        else
+            err "变量名不合法（只能含字母、数字、下划线，且不能以数字开头）。"
+        fi
+        TOKEN_VAR=""
+        return
+    fi
     rds token "请输入机器人 Token（输入不显示）"
     [[ -n "$token" ]] || { warn "已取消。"; return; }
 
@@ -770,8 +779,13 @@ cfg_ids() {
     local mode="$1" file="$2" raw ids id
     heading "写入管理员 / 用户 ID"
     [[ "$mode" == "py" ]] && suggest_vars "$file"
-    ask ID_VAR "用户ID 变量名" "$ID_VAR"
-    valid_name "$ID_VAR" || { err "变量名不合法或为空。"; return; }
+    echo "  ${DIM}变量名是代码里读取管理员 ID 的名字，直接回车使用默认值${RESET}"
+    ask ID_VAR "用户ID 变量名" "${ID_VAR:-ADMIN_IDS}"
+    if ! valid_name "$ID_VAR"; then
+        err "变量名不合法（只能含字母、数字、下划线，且不能以数字开头）。"
+        ID_VAR=""
+        return
+    fi
     rd raw "用户 ID（多个用空格或逗号分隔）"
     ids="$(normalize_ids "$raw")"
     [[ -n "$ids" ]] || { warn "已取消。"; return; }
