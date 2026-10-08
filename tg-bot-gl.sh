@@ -913,9 +913,132 @@ cfg_ids() {
     write_value "$mode" "$file" "$ID_VAR" ids "$fallback" "$ids" && save_conf
 }
 
+# 扫描代码里通过环境变量读取的变量名（每行一个）
+scan_env_names() {
+    python3 - "$INSTALL_DIR" <<'PY' 2>/dev/null
+import ast, os, re, sys
+root = sys.argv[1]
+NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+names = set()
+base = root.rstrip(os.sep).count(os.sep)
+for dp, dn, fn in os.walk(root):
+    dn[:] = [d for d in dn if d not in {".git", "__pycache__", "venv", ".venv", "node_modules"}]
+    if dp.count(os.sep) - base >= 2:
+        dn[:] = []
+    for f in fn:
+        if not f.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(open(os.path.join(dp, f), encoding="utf-8", errors="ignore").read())
+        except (SyntaxError, OSError):
+            continue
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Call) and n.args and isinstance(n.args[0], ast.Constant) \
+               and isinstance(n.args[0].value, str) and NAME.match(n.args[0].value) \
+               and isinstance(n.func, ast.Attribute) and n.func.attr in ("getenv", "get") \
+               and ("environ" in ast.dump(n.func) or n.func.attr == "getenv"):
+                names.add(n.args[0].value)
+            elif isinstance(n, ast.Subscript) and "environ" in ast.dump(n.value) \
+                 and isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, str) \
+                 and NAME.match(n.slice.value):
+                names.add(n.slice.value)
+print("\n".join(sorted(names)))
+PY
+}
+
+# 变量名是否像密钥 / ID（用来筛掉路径、开关之类的普通变量）
+is_secret_name() {
+    [[ "$1" =~ (KEY|TOKEN|SECRET|PASS|PASSWD|PASSWORD|API|CREDENTIAL|(^|_)IDS?$) ]]
+}
+
+# 变量说明：这个变量是哪个 API / 服务的密钥
+var_desc() {
+    case "$1" in
+        BOT_TOKEN)         echo "Telegram 机器人 Token（@BotFather 获取）[必填]" ;;
+        ADMIN_IDS)         echo "Telegram 管理员用户ID（多个用空格或逗号分隔）[必填]" ;;
+        GLOBALPING_TOKEN)  echo "Globalping API Token（globalping.io，提高探测额度）[可选]" ;;
+        ABUSEIPDB_KEY)     echo "AbuseIPDB API 密钥（abuseipdb.com，IP 信誉/滥用查询）[可选]" ;;
+        IPAPI_IS_KEY)      echo "ipapi.is API 密钥（ipapi.is，IP 信息查询）[可选]" ;;
+        PROXYCHECK_KEY)    echo "proxycheck.io API 密钥（代理 / VPN 检测）[可选]" ;;
+        *)
+            local base="$1"
+            base="${base%_API_KEY}"; base="${base%_API_TOKEN}"; base="${base%_KEY}"
+            base="${base%_TOKEN}"; base="${base%_SECRET}"; base="${base%_PASSWORD}"
+            if [[ "$1" =~ IDS?$ ]]; then echo "${base} 相关的数字 ID [自动识别]"
+            else echo "${base} 的 API 密钥 / 凭据 [自动识别]"; fi ;;
+    esac
+}
+
+env_is_set() {
+    local f="$INSTALL_DIR/.env"
+    [[ -f "$f" ]] && grep -qE "^$1=.+" "$f"
+}
+
+# 依次询问并写入一个环境变量
+fill_env_var() {
+    local name="$1" desc val id ids bad=0
+    desc="$(var_desc "$name")"
+    echo
+    echo "  ${BOLD}${name}${RESET}"
+    echo "  ${DIM}${desc}${RESET}"
+    if [[ "$name" =~ IDS?$ ]]; then
+        rd val "请输入（多个用空格或逗号分隔；回车跳过）"
+        [[ -n "$val" ]] || { echo "  已跳过。"; return 0; }
+        ids="$(normalize_ids "$val")"
+        for id in $ids; do [[ "$id" =~ ^-?[0-9]+$ ]] || bad=1; done
+        (( bad )) && { err "ID 必须是数字，已跳过。"; return 1; }
+        write_value env "$INSTALL_DIR/.env" "$name" ids ids "$ids"
+    else
+        rds val "请输入（输入不显示；回车跳过）"
+        [[ -n "$val" ]] || { echo "  已跳过。"; return 0; }
+        write_value env "$INSTALL_DIR/.env" "$name" str str "$val"
+    fi
+}
+
+# 扫描出代码里需要密钥的变量，结果放到 SECRET_VARS
+scan_secret_vars() {
+    SECRET_VARS=()
+    local n
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && is_secret_name "$n" && SECRET_VARS+=("$n")
+    done < <(scan_env_names)
+}
+
 cfg_custom() {
-    local mode="$1" file="$2" name t value
-    heading "写入自定义变量"
+    local mode="$1" file="$2" c i n st
+    SECRET_VARS=()
+    heading "自定义变量（自动扫描）"
+    scan_secret_vars
+    if (( ${#SECRET_VARS[@]} > 0 )); then
+        echo "  ${DIM}已从代码中扫描到以下需要填写的变量（统一写入 .env）：${RESET}"
+        echo
+        for i in "${!SECRET_VARS[@]}"; do
+            n="${SECRET_VARS[i]}"
+            if env_is_set "$n"; then st="${GREEN}已设置${RESET}"; else st="${YELLOW}未设置${RESET}"; fi
+            printf '  %s) %s %s\n' "${YELLOW}$((i + 1))${RESET}" "$(padr "$n" 20)" "$st"
+            echo "       ${DIM}$(var_desc "$n")${RESET}"
+        done
+        echo
+        printf "  %s  %s  %s\n" "${YELLOW}↵${RESET}" "$(padr "回车" 22)" "${DIM}依次填写所有「未设置」的变量${RESET}"
+        menu_item a "全部重新填写"
+        menu_item m "手动输入变量名"
+        echo "  ${DIM}或输入编号只填写某一个${RESET}"
+        echo
+        rd c "请选择" ""
+        case "$c" in
+            "") for n in "${SECRET_VARS[@]}"; do env_is_set "$n" || fill_env_var "$n"; done; return ;;
+            a|A) for n in "${SECRET_VARS[@]}"; do fill_env_var "$n"; done; return ;;
+            m|M) ;;
+            *) if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#SECRET_VARS[@]} )); then
+                   fill_env_var "${SECRET_VARS[c-1]}"; return
+               fi
+               err "无效选择：$c"; return ;;
+        esac
+    else
+        warn "没有从代码中扫描到需要填写的变量，改为手动输入。"
+    fi
+
+    local name t value
     rd name "变量名"
     valid_name "$name" || { err "变量名不合法。"; return; }
     menu_item 1 "字符串" "写成 'xxx'"
@@ -969,7 +1092,7 @@ do_config() {
         echo
         menu_item 1 "机器人 Token" "输入时不显示"
         menu_item 2 "管理员 / 用户 ID" "支持多个"
-        menu_item 3 "自定义变量" "任意名称"
+        menu_item 3 "自定义变量 / API 密钥" "自动扫描代码需要的密钥"
         menu_item 0 "返回"
         echo
         rd c "请选择"
@@ -1193,6 +1316,21 @@ quick_keys() {
     fi
     cfg_token "$mode" "$file"
     cfg_ids "$mode" "$file"
+
+    # 代码里还有其他 API 密钥时，提示是否现在填写
+    local extra=() n
+    scan_secret_vars
+    for n in "${SECRET_VARS[@]}"; do
+        [[ "$n" == "$TOKEN_VAR" || "$n" == "$ID_VAR" ]] && continue
+        env_is_set "$n" || extra+=("$n")
+    done
+    if [[ "$mode" == "env" ]] && (( ${#extra[@]} > 0 )); then
+        echo
+        echo "  ${DIM}代码里还支持这些可选 API 密钥：${extra[*]}${RESET}"
+        if confirm "现在填写？（每项可回车跳过；之后也可在 管理机器人 → 5 → 3 里填）"; then
+            for n in "${extra[@]}"; do fill_env_var "$n"; done
+        fi
+    fi
 }
 
 add_bot() {

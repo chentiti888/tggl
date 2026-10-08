@@ -4340,8 +4340,7 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     )
     return 6371 * 2 * math.asin(min(1.0, math.sqrt(a)))
 IPMAP_API = "https://ipmap-api.ripe.net/v1/locate/all?resources="
-IPMAP_MEASURED_ENGINES = {"latency", "single-radius", "simple-anycast", "ixp"}
-TRUSTED_GEO = ("ipmap", "ping", "route")  # 只有实测结果算"已确认"：IPmap 实测引擎、多地 ping
+TRUSTED_GEO = ("ipmap", "rdns", "ping")
 CITY_TABLE = {
     "losangeles": ("洛杉矶", 34.05, -118.24, "US"),
     "sanjose": ("圣何塞", 37.34, -121.89, "US"),
@@ -4478,13 +4477,30 @@ def _ipmap_batch(ips):
                 row = row["location"]
             if row.get("latitude") is None or row.get("longitude") is None:
                 continue
-            # 只用 IPmap 实测引擎（延迟测量 / 单点半径 / 任播检测 / IXP）给出的位置；
-            # 只靠反向域名字面匹配或人口权重"猜"出来的位置一律不用
             engines = set((row.get("contributions") or {}).keys())
-            if not engines & IPMAP_MEASURED_ENGINES:
+            if engines:
+                if not engines - {"worlds"}:
+                    continue
+            elif (row.get("score") or 0) < 10:
                 continue
             result[ip] = row
     return result
+
+def _rdns_city(hostname):
+    host = (hostname or "").lower().rstrip(".")
+    if not host:
+        return None
+    domain_codes = {}
+    for domain, codes in DOMAIN_CITY_CODES.items():
+        if host.endswith(domain):
+            domain_codes = codes
+    for token in re.findall(r"[a-z]+", host):
+        key = domain_codes.get(token) or CITY_CODES.get(token)
+        if key is None and token in CITY_TABLE:
+            key = token
+        if key:
+            return key
+    return None
 
 def _rdns_batch(ips, budget=4.0):
     from concurrent.futures import ThreadPoolExecutor, wait
@@ -4509,11 +4525,6 @@ def _too_fast(rtt, km):
     return rtt < km / 100 * factor - 2
 
 def _refine_geo(runs, raw_geo):
-    """
-    每一跳的位置：有 IPmap 实测结果就用实测，没有就用 IP 库（ip-api，和全球 ping 同一个库）。
-    不根据反向域名、延迟去猜位置，也不改动、不丢弃任何一跳。
-    反向域名只作为路由器名称显示在表格里。
-    """
     ips = []
     for _source, hops in runs:
         for hop in hops:
@@ -4526,87 +4537,117 @@ def _refine_geo(runs, raw_geo):
                     pass
     ipmap = _ipmap_batch(ips) if ips else {}
     names = _rdns_batch(ips) if ips else {}
+    samples = {}
+    for source, hops in runs:
+        if source.get("lat") is None or source.get("lon") is None:
+            continue
+        for hop in hops:
+            if hop.get("ip") and hop.get("rtt") is not None:
+                samples.setdefault(hop["ip"], []).append(
+                    (float(source["lat"]), float(source["lon"]), hop["rtt"])
+                )
+    def possible(lat, lon, ip):
+        return not any(
+            _too_fast(rtt, _haversine_km(slat, slon, lat, lon))
+            for slat, slon, rtt in samples.get(ip, [])
+        )
     geo = {}
     for ip in ips:
         base = dict(raw_geo.get(ip) or {})
-        if base.get("lat") is not None and not (base["lat"] == 0 and base["lon"] == 0):
-            base["src"] = "ipdb"
-        else:
-            base.update(lat=None, lon=None, src=None)
+        candidates = []
         row = ipmap.get(ip)
         if row:
             city_key = re.sub(r"[^a-z]", "", (row.get("cityNameAscii") or row.get("cityName") or "").lower())
-            base.update(
-                src="ipmap",
-                lat=float(row["latitude"]),
-                lon=float(row["longitude"]),
-                city=CITY_TABLE.get(city_key, (row.get("cityNameAscii") or row.get("cityName") or "",))[0],
-                country=_country_zh(row.get("countryCodeAlpha2"), base),
-            )
+            candidates.append((
+                "ipmap",
+                float(row["latitude"]),
+                float(row["longitude"]),
+                CITY_TABLE.get(city_key, (row.get("cityNameAscii") or row.get("cityName") or "",))[0],
+                _country_zh(row.get("countryCodeAlpha2"), base),
+            ))
+        key = _rdns_city(names.get(ip))
+        if key:
+            zh, lat, lon, cc = CITY_TABLE[key]
+            candidates.append(("rdns", lat, lon, zh, _country_zh(cc, base)))
+        if base.get("lat") is not None and not (base["lat"] == 0 and base["lon"] == 0):
+            candidates.append((
+                "ipdb",
+                float(base["lat"]),
+                float(base["lon"]),
+                base.get("city") or "",
+                base.get("country") or "",
+            ))
+        chosen = next(
+            (c for c in candidates if possible(c[1], c[2], ip)),
+            None
+        )
+        if chosen:
+            src, lat, lon, city, country = chosen
+            base.update(src=src, lat=lat, lon=lon, city=city, country=country)
+        elif candidates:
+            base.update(src=None, lat=None, lon=None, suspect=True)
         if names.get(ip):
             base["rdns"] = names[ip]
         geo[ip] = base
     return geo
 
 def _sanitize_geo(source, hops, geo):
-    """
-    只核对终点：IP 库给的终点位置如果和这次实测的路由在物理上矛盾，就按路由实际到达的地方定位。
-    依据（全是实测数据，不是推测）：
-      光在光纤里 1ms 往返最多走 100km 单程距离；
-      包已经实测经过了某一跳，再从那一跳到终点，总路程不可能超过终点延迟允许的距离。
-    例：经过洛杉矶的节点、终点延迟 142ms，IP 库却说终点在香港——从洛杉矶回香港至少还要 110ms，不可能。
-    中间跳的位置不改，原样画。
-    """
     slat, slon = source.get("lat"), source.get("lon")
-    last = hops[-1] if hops else None
-    if (
-        slat is None or slon is None
-        or not source.get("reached")
-        or not last or not last.get("ip") or last.get("rtt") is None
-    ):
-        return geo
-    tinfo = geo.get(last["ip"])
-    if not tinfo or tinfo.get("lat") is None:
+    if slat is None or slon is None:
         return geo
     slat, slon = float(slat), float(slon)
-    reach = last["rtt"] * 100 + 500  # 终点延迟允许的最大单程距离（含 500km 余量）
-
-    def km_from_src(info):
-        return _haversine_km(slat, slon, float(info["lat"]), float(info["lon"]))
-
-    passed = []  # 实测经过、且自身位置和自己的延迟不矛盾的跳点
+    fixed = dict(geo)
+    def drop(ip, info):
+        fixed[ip] = dict(info, src=None, lat=None, lon=None, suspect=True)
+    def checkable(info):
+        return (
+            info
+            and info.get("lat") is not None
+            and info.get("src") not in TRUSTED_GEO
+        )
+    for hop in hops:
+        ip = hop.get("ip")
+        info = fixed.get(ip) if ip else None
+        if not checkable(info) or hop.get("rtt") is None:
+            continue
+        distance = _haversine_km(slat, slon, float(info["lat"]), float(info["lon"]))
+        if _too_fast(hop["rtt"], distance) or (
+            distance >= 300
+            and hop["rtt"] > distance / 100 * 2.5 + 60
+        ):
+            drop(ip, info)
+    last = hops[-1] if hops else None
+    if not (
+        source.get("reached")
+        and last and last.get("ip") and last.get("rtt") is not None
+    ):
+        return fixed
+    target_info = fixed.get(last["ip"])
+    if not target_info or target_info.get("lat") is None:
+        return fixed
+    tlat = float(target_info["lat"])
+    tlon = float(target_info["lon"])
+    anchor_lat, anchor_lon, anchor_rtt = slat, slon, 0.0
     for hop in hops[:-1]:
-        info = geo.get(hop["ip"]) if hop.get("ip") else None
-        if not info or info.get("lat") is None or hop.get("rtt") is None:
+        ip = hop.get("ip")
+        info = fixed.get(ip) if ip else None
+        if not info or info.get("lat") is None:
             continue
-        if info["lat"] == 0 and info["lon"] == 0:
-            continue
-        d = km_from_src(info)
-        if d <= hop["rtt"] * 100 + 500 and d <= reach:
-            passed.append((hop, info))
-    tlat, tlon = float(tinfo["lat"]), float(tinfo["lon"])
-    conflict = km_from_src(tinfo) > reach or any(
-        km_from_src(info)
-        + _haversine_km(float(info["lat"]), float(info["lon"]), tlat, tlon) > reach
-        for _hop, info in passed
-    )
-    if not conflict:
-        return geo
-    old_place = tinfo.get("city") or tinfo.get("country") or "其它地方"
-    if passed:
-        hop, info = passed[-1]
-        new = dict(
-            tinfo, src="route",
-            lat=float(info["lat"]), lon=float(info["lon"]),
-            city=info.get("city") or "", country=info.get("country") or "",
-            route_note=f"IP库定位为{old_place}，与实测路由矛盾，按最后经过的第 {hop['n']} 跳定位",
-        )
-    else:
-        new = dict(
-            tinfo, src=None, lat=None, lon=None, suspect=True,
-            route_note=f"IP库定位为{old_place}，与实测延迟矛盾",
-        )
-    return dict(geo, **{last["ip"]: new})
+        blat = float(info["lat"])
+        blon = float(info["lon"])
+        if checkable(info):
+            extra_km = (
+                _haversine_km(anchor_lat, anchor_lon, blat, blon)
+                + _haversine_km(blat, blon, tlat, tlon)
+                - _haversine_km(anchor_lat, anchor_lon, tlat, tlon)
+            )
+            if extra_km > 800 and extra_km / 200 * 1.3 > last["rtt"] - anchor_rtt + 8:
+                drop(ip, info)
+                continue
+        if hop.get("rtt") is not None:
+            anchor_lat, anchor_lon = blat, blon
+            anchor_rtt = min(hop["rtt"], last["rtt"])
+    return fixed
 
 def _build_points(source, hops, geo):
     raw = []
@@ -4626,7 +4667,7 @@ def _build_points(source, hops, geo):
         raw.append({
             "first": str(hop["n"]), "last": str(hop["n"]),
             "lat": float(info["lat"]), "lon": float(info["lon"]),
-            "sure": True,
+            "sure": info.get("src") in TRUSTED_GEO,
             "dest": bool(
                 source.get("reached") and hop is last_hop
             ),
@@ -5045,10 +5086,14 @@ CARRIER_COLORS = {
 
 def _compare_route_points(points, anchor=None):
     """
-    三网地图按路由实际经过的每一跳画线，不挑点、不补点；
-    从起点开始重新做经度连续化，三条线在同一坐标系里。
+    三网地图只画可信的点：起点、终点、经实测/反向域名核实的跳点。
+    只靠 IP 库登记地的跳点（例如登记在非洲的国内段）一律不画，免得线路乱绕；
+    过滤后再从起点开始重新做经度连续化，三条线在同一坐标系里。
     """
-    kept = [dict(p) for p in points]
+    kept = [
+        dict(p) for p in points
+        if p.get("start") or p.get("dest") or p.get("sure")
+    ]
     previous = anchor
     for point in kept:
         lon = point["lon"]
@@ -5060,6 +5105,22 @@ def _compare_route_points(points, anchor=None):
         point["lon"] = lon
         previous = lon
     return kept
+
+def _compare_target(results):
+    """三网结果里取目标的位置（先取到达终点的那条，取不到返回 None）。"""
+    found = None
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        best = result.get("best") or {}
+        source = best.get("source") or {}
+        info = (best.get("geo") or {}).get(source.get("target_ip"))
+        if info and info.get("lat") is not None and info.get("lon") is not None:
+            if not (info["lat"] == 0 and info["lon"] == 0):
+                if source.get("reached"):
+                    return info
+                found = found or info
+    return found
 
 def _render_compare_map(routes, target=None, reached=None):
     """
@@ -5368,7 +5429,6 @@ GEO_SOURCE_TEXT = {
     "ipmap": "RIPE IPmap 实测",
     "rdns": "路由器名称",
     "ping": "多地 ping 实测",
-    "route": "按实测路由定位",
     "ipdb": "IP库估计，未确认",
 }
 
@@ -5447,7 +5507,7 @@ def _hop_table(hops, geo):
     return lines
 
 def _route_summary(source, hops, geo):
-    """绕路判断 + 出境段。绕路按实测延迟与直线理想延迟的差距判断。"""
+    """绕路判断 + 出境段。绕路只看核实过位置的中间跳是否偏离直线，不看延迟高低。"""
     result = {"detour": None, "exit": None}
     responding = [
         h for h in hops
@@ -5467,14 +5527,28 @@ def _route_summary(source, hops, geo):
             )
             ideal = km / 100 * 1.25 + 10
             rtt = last["rtt"]
-            # 绕路看实测延迟比直线理想值多出多少。
-            # 路由器的 IP 库位置经常是运营商注册地，不能拿来算路程，否则会把正常线路判成绕路
-            if rtt <= ideal * 1.3 + 15:
-                judge = "✅ 未见明显绕路"
-            elif rtt <= ideal * 1.8 + 30:
+            src_lat, src_lon = float(source["lat"]), float(source["lon"])
+            dst_lat, dst_lon = float(target_info["lat"]), float(target_info["lon"])
+            extra = 0.0
+            for hop in hops:
+                info = geo.get(hop["ip"]) if hop.get("ip") else None
+                if (
+                    not info or info.get("lat") is None
+                    or info.get("src") not in TRUSTED_GEO
+                    or hop is last
+                ):
+                    continue
+                via = (
+                    _haversine_km(src_lat, src_lon, float(info["lat"]), float(info["lon"]))
+                    + _haversine_km(float(info["lat"]), float(info["lon"]), dst_lat, dst_lon)
+                )
+                extra = max(extra, via - km)
+            if extra > max(1500, km * 0.5):
+                judge = "🔴 明显绕路"
+            elif extra > max(600, km * 0.3):
                 judge = "🟡 可能略有绕路"
             else:
-                judge = "🔴 明显绕路"
+                judge = "✅ 未见明显绕路"
             result["detour"] = (
                 judge,
                 f"实测 {rtt:.0f}ms　理想 {ideal:.0f}ms · 直线 {km:,.0f} km"
@@ -5567,7 +5641,7 @@ def _build_route_text(
     head.append("")
     head.append(f"🔀 共 {len(hops)} 跳")
     table = _hop_table(hops, geo)
-    foot = "✓实测定位 ?IP库定位　地图按实际经过的跳点画线"
+    foot = "✓实测确认 ?IP库估计 ×存疑　地图：实线已确认，虚线未确认"
     def compose(lines):
         body = "\n".join(e(text) for _sep, text in lines)
         return (
@@ -5685,8 +5759,13 @@ def _verify_exit(source, hops, geo):
         )
         info["ping_note"] = f"ping 实测：{measured}"
         return dict(geo, **{ip: info})
-    # 实测没落在任何一个城市附近：保留 IP 库位置，只在备注里写出实测数据
     info["ping_note"] = f"ping 实测：{measured}，均不在附近"
+    if info.get("lat") is not None:
+        for s in samples:
+            km = _haversine_km(s["lat"], s["lon"], float(info["lat"]), float(info["lon"]))
+            if _too_fast(s["rtt"], km) or (km < 100 and s["rtt"] >= 8):
+                info.update(src=None, lat=None, lon=None, suspect=True)
+                break
     return dict(geo, **{ip: info})
 
 def route_keyboard():
@@ -6425,6 +6504,69 @@ def _analyse_runs(runs):
         "summary": _route_summary(best["source"], best["hops"], best["geo"]),
     }
 
+def _unify_target_geo(results):
+    """
+    三网测的是同一个目标，但每家各自定位，可能把目标放到不同地方
+    （比如电信、联通定位在美国，移动却定位到东南亚），导致绕路判断和地图都错。
+    这里统一成一个位置：优先实测 / 反向域名核实过的，其次多数一致的，
+    再其次延迟最低那家的。统一后重新算绕路判断。
+    """
+    entries = []
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        best = result["best"]
+        tip = best["source"].get("target_ip")
+        if not tip:
+            continue
+        info = best["geo"].get(tip)
+        if info and (info.get("lat") is None or info.get("lon") is None):
+            info = None
+        entries.append((result, tip, info))
+    located = [info for _r, _t, info in entries if info]
+    if not located and not any(r["best"]["source"].get("reached") for r, _t, _i in entries):
+        return
+    def km(a, b):
+        return _haversine_km(float(a["lat"]), float(a["lon"]), float(b["lat"]), float(b["lon"]))
+    def last_sure_hop(result):
+        """到达终点的线路里，最后一个位置核实过的中间跳：(位置, 它到终点还剩多少毫秒)。"""
+        best = result["best"]
+        rtt = _target_rtt(best["source"], best["hops"])
+        if rtt is None:
+            return None
+        for hop in reversed(best["hops"][:-1]):
+            g = best["geo"].get(hop["ip"]) if hop.get("ip") else None
+            if (g and g.get("lat") is not None and g.get("src") in TRUSTED_GEO
+                    and hop.get("rtt") is not None):
+                return g, max(0.0, rtt - hop["rtt"])
+        return None
+    anchors = [a for a in (last_sure_hop(r) for r, _t, _i in entries) if a]
+    def physics_ok(info):
+        return all(km(g, info) <= left * 100 + 500 for g, left in anchors)
+    def rank(item):
+        result, _tip, info = item
+        agree = sum(1 for other in located if km(info, other) < 500)
+        rtt = _target_rtt(result["best"]["source"], result["best"]["hops"])
+        return (info.get("src") in TRUSTED_GEO, agree, -(rtt if rtt is not None else 1e9))
+    valid = [e for e in entries if e[2] and physics_ok(e[2])]
+    if valid:
+        chosen = max(valid, key=rank)[2]
+    elif anchors:
+        g, _left = min(anchors, key=lambda a: a[1])
+        chosen = {"lat": g["lat"], "lon": g["lon"], "src": "hop"}
+    elif located:
+        chosen = max((e for e in entries if e[2]), key=rank)[2]
+    else:
+        return
+    for result, tip, info in entries:
+        best = result["best"]
+        if info and km(info, chosen) < 100:
+            continue
+        if not info and not best["source"].get("reached"):
+            continue
+        best["geo"][tip] = dict(chosen)
+        result["summary"] = _route_summary(best["source"], best["hops"], best["geo"])
+
 def _target_rtt(source, hops):
     if source.get("reached") and hops and hops[-1].get("rtt") is not None:
         return hops[-1]["rtt"]
@@ -6478,6 +6620,10 @@ async def route_compare(query, context):
         )
     finally:
         await progress.stop()
+    try:
+        _unify_target_geo(results)
+    except Exception as e:
+        print("统一目标位置失败：", e)
     blocks = []
     table = []
     for (name, code), result in zip(CARRIER_CODES, results):
@@ -6506,7 +6652,14 @@ async def route_compare(query, context):
             print("三网测试地图取点失败：", name, e)
     image = None
     try:
-        target_geo = None  # 不画推测的终点连线，只画路由实际经过的跳点
+        target_geo = _compare_target(results)
+        if target_geo is None:
+            target_ip = next((
+                r["best"]["source"].get("target_ip") for r in results
+                if not isinstance(r, Exception) and r["best"]["source"].get("target_ip")
+            ), None)
+            if target_ip:
+                target_geo = (await asyncio.to_thread(_geo_batch, [target_ip])).get(target_ip)
         reached = {
             name: bool(r["best"]["source"].get("reached"))
             for (name, _code), r in zip(CARRIER_CODES, results)
