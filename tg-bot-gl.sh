@@ -132,6 +132,11 @@ mask() {
     fi
 }
 
+if [[ ! -t 0 && -z "${TGBOT_NONINTERACTIVE:-}" ]]; then
+    err "需要交互式终端。请用：bash <(curl -fsSL 脚本地址)，不要用 curl ... | bash"
+    exit 1
+fi
+
 [[ $EUID -eq 0 ]] || { err "请使用 root 运行：sudo bash $0"; exit 1; }
 
 # ---------------------------------------------------------------- 配置与状态
@@ -456,12 +461,10 @@ def gather(root):
                     mods.add(a.name.split(".")[0])
             elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
                 mods.add(node.module.split(".")[0])
-    try:
-        for d in os.listdir(root):
-            if os.path.isdir(os.path.join(root, d)):
-                local.add(d)
-    except OSError:
-        pass
+    for dp, dn, fn in os.walk(root):
+        dn[:] = [d for d in dn if d not in {".git", "__pycache__", "venv", ".venv", "node_modules"}]
+        local.update(dn)
+        local.update(os.path.splitext(f)[0] for f in fn if f.endswith(".py"))
     return mods, local, text
 
 
@@ -1215,11 +1218,11 @@ create_dir() {
     while true; do
         rd dir "目录" "$def"
         if [[ -z "$dir" ]]; then warn "已取消。"; return 1; fi
-        dir="${dir%/}"
         if [[ "$dir" != /* ]]; then
             err "必须是绝对路径（以 / 开头）。"
             continue
         fi
+        dir="$(realpath -m -- "$dir" 2>/dev/null || echo "${dir%/}")"
         if is_unsafe_dir "$dir"; then
             err "不能直接使用系统目录 $dir，请使用其下的子目录，例如 $dir/mybot"
             continue
@@ -1275,7 +1278,7 @@ pick_dir() {
     echo
     rd sel "选择" "默认"
     if [[ "$sel" == "默认" ]]; then
-        PICKED_DIR="${def%/}"
+        PICKED_DIR="$(realpath -m -- "$def" 2>/dev/null || echo "${def%/}")"
         mkdir -p "$PICKED_DIR" || { err "创建失败：$PICKED_DIR"; return 1; }
         mkdir -p "$CONF_DIR" && chmod 700 "$CONF_DIR"
         grep -qxF -- "$PICKED_DIR" "$DIRS_FILE" 2>/dev/null || echo "$PICKED_DIR" >>"$DIRS_FILE"
@@ -1344,8 +1347,11 @@ add_bot() {
     while true; do
         rd name "名称（直接回车取消）"
         if [[ -z "$name" ]]; then warn "已取消。"; return 1; fi
-        if [[ ! "$name" =~ ^[a-z0-9_-]+$ ]]; then err "名称不合法，请重新输入。"; continue; fi
+        if [[ ! "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then err "名称不合法（小写字母/数字开头，只含小写字母、数字、- 和 _）。"; continue; fi
         if [[ -f "$CONF_DIR/$name.conf" ]]; then err "已存在同名机器人：$name，请换一个。"; continue; fi
+        if [[ -e "/etc/systemd/system/$name.service" || -e "/lib/systemd/system/$name.service" || -e "/usr/lib/systemd/system/$name.service" ]]; then
+            err "系统里已存在同名服务 $name（会被覆盖），请换一个名称。"; continue
+        fi
         break
     done
 
