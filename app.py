@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram API callback receiver.
-
-- Receives JSON or application/x-www-form-urlencoded POST requests.
-- Forwards callback payloads to a dedicated Telegram bot/chat.
-- Listens only on 127.0.0.1:8787; expose it through your HTTPS reverse proxy.
-- Configure via /etc/tg-callback.env (see README instructions in chat).
-
-Security notes:
-- Protect the callback URL with a long random secret.
-- This generic receiver does not validate provider-specific webhook signatures.
-- Do not send passwords, one-time codes, access tokens, or other sensitive data to Telegram.
+Configure the three values in the CONFIG section below, or provide them through
+environment variables. This is a callback receiver, not a polling Telegram bot.
 """
 import hmac
 import json
@@ -20,36 +12,60 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+# ===================== CONFIG =====================
+# Fill these in here if you do not want to configure systemd EnvironmentFile.
+BOT_TOKEN = "PUT_NEW_BOT_TOKEN_HERE"
+CHAT_ID = "PUT_CHAT_ID_HERE"
+WEBHOOK_SECRET = "PUT_48_CHAR_RANDOM_SECRET_HERE"
+
+# Environment variables, if present, override the values above.
+BOT_TOKEN = os.environ.get("BOT_TOKEN", BOT_TOKEN)
+CHAT_ID = os.environ.get("CHAT_ID", CHAT_ID)
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", WEBHOOK_SECRET)
+
+HOST = "127.0.0.1"
+PORT = 8787
+MAX_BODY = 64 * 1024
+# ==================================================
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(message)s",
 )
-MAX_BODY = 64 * 1024
 
+def validate_config():
+    missing = []
+    if not BOT_TOKEN or BOT_TOKEN == "PUT_NEW_BOT_TOKEN_HERE":
+        missing.append("BOT_TOKEN")
+    if not CHAT_ID or CHAT_ID == "PUT_CHAT_ID_HERE":
+        missing.append("CHAT_ID")
+    if not WEBHOOK_SECRET or WEBHOOK_SECRET == "PUT_48_CHAR_RANDOM_SECRET_HERE":
+        missing.append("WEBHOOK_SECRET")
+    if missing:
+        raise SystemExit(
+            "Configuration missing: " + ", ".join(missing)
+            + ". Set these values in the CONFIG section of app.py "
+              "or provide them as environment variables."
+        )
 
-def send_telegram(message: str) -> None:
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = urllib.parse.urlencode({
         "chat_id": CHAT_ID,
         "text": message[:4000],
     }).encode("utf-8")
-    request = urllib.request.Request(url, data=data, method="POST")
-    with urllib.request.urlopen(request, timeout=10) as response:
+    req = urllib.request.Request(url, data=data, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as response:
         result = json.loads(response.read().decode("utf-8"))
         if not result.get("ok"):
             raise RuntimeError("Telegram API rejected the message")
 
-
 class CallbackHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        # Avoid logging request bodies or secret-bearing query strings.
+        # Do not log request bodies or secret-bearing query strings.
         logging.info("HTTP %s %s", self.command, urllib.parse.urlsplit(self.path).path)
 
-    def reply(self, status: int, message: str) -> None:
+    def reply(self, status, message):
         body = json.dumps(
             {"ok": status == 200, "message": message},
             ensure_ascii=False,
@@ -87,29 +103,24 @@ class CallbackHandler(BaseHTTPRequestHandler):
         try:
             raw = self.rfile.read(length)
             content_type = self.headers.get("Content-Type", "").lower()
-
             if "application/json" in content_type:
                 payload = json.loads(raw.decode("utf-8"))
             elif "application/x-www-form-urlencoded" in content_type:
                 payload = urllib.parse.parse_qs(
-                    raw.decode("utf-8"),
-                    keep_blank_values=True,
+                    raw.decode("utf-8"), keep_blank_values=True
                 )
             else:
                 self.reply(415, "Unsupported content type")
                 return
 
             if not isinstance(payload, (dict, list)):
-                self.reply(400, "Expected a JSON object, array, or form")
+                self.reply(400, "Expected JSON object, array, or form")
                 return
 
-            # This generic receiver forwards the supplied payload as-is.
-            # Use only with test/non-sensitive callback data until provider
-            # signature validation and field filtering are configured.
+            # Only test/non-sensitive payloads should be used until the
+            # provider's signature and sensitive-field rules are configured.
             message = "收到 API 回调：\n" + json.dumps(
-                payload,
-                ensure_ascii=False,
-                indent=2,
+                payload, ensure_ascii=False, indent=2
             )
             send_telegram(message)
             self.reply(200, "Accepted")
@@ -119,10 +130,10 @@ class CallbackHandler(BaseHTTPRequestHandler):
             logging.exception("Callback processing failed")
             self.reply(502, "Forwarding failed")
 
-
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("127.0.0.1", 8787), CallbackHandler)
-    logging.info("Telegram callback receiver listening on 127.0.0.1:8787")
+    validate_config()
+    server = ThreadingHTTPServer((HOST, PORT), CallbackHandler)
+    logging.info("Callback receiver listening on %s:%s", HOST, PORT)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
