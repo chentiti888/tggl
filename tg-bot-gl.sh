@@ -1129,7 +1129,7 @@ cfg_custom() {
     fi
 }
 
-do_config() {
+do_config_manual() {
     if [[ ! -d "$INSTALL_DIR" ]]; then
         warn "目录不存在：$INSTALL_DIR，请先获取机器人代码。"
         return 1
@@ -1380,7 +1380,7 @@ pick_dir() {
 # ---------------------------------------------------------------- 添加机器人
 
 # 按代码决定写入方式：代码从环境变量读取就写 .env，否则写主程序里的变量
-quick_keys() {
+quick_keys_legacy() {
     local mode file
     if [[ -n "$(detect_vars env "" | sed -n 's/^TOKEN=//p')" ]]; then
         mode="env"; file="$INSTALL_DIR/.env"
@@ -1408,11 +1408,902 @@ quick_keys() {
     if [[ "$mode" == "env" ]] && (( ${#extra[@]} > 0 )); then
         echo
         echo "  ${DIM}代码里还支持这些可选 API 密钥：${extra[*]}${RESET}"
-        if confirm "现在填写？（每项可回车跳过；之后也可在 管理机器人 → 5 → 3 里填）"; then
+        if confirm "现在填写？（每项可回车跳过；之后也可在 管理机器人 → 5 里填）"; then
             for n in "${extra[@]}"; do fill_env_var "$n"; done
         fi
     fi
 }
+
+# ---------------------------------------------------------------- 自动识别需要填写的配置
+# 一次扫描整个项目 (最深 5 层目录), 能识别:
+#   环境变量: os.getenv / os.environ.get / os.environ[...] / from os import getenv / env = os.environ
+#             python-decouple config() / environs Env() / pydantic BaseSettings / A or B or 默认值
+#   示例文件: .env.example / .env.sample / .env.template ... (里面的注释当作说明)
+#   代码常量: TOKEN = "YOUR_TOKEN" 这类还没填的占位符 (项目不用环境变量时)
+#   JSON 配置: config.example.json 等 (自动复制成 config.json 再逐项填写)
+# 结果按 必填 / 可选 / 高级(一般不用改) 分组
+VS_SRC=(); VS_NAME=(); VS_GRP=(); VS_KIND=(); VS_DEF=(); VS_DESC=(); VS_FILE=(); VS_ST=()
+VARS_CHANGED=0
+
+scan_all() {
+    VS_SRC=(); VS_NAME=(); VS_GRP=(); VS_KIND=(); VS_DEF=(); VS_DESC=(); VS_FILE=(); VS_ST=()
+    local a b c d e f g h
+    while IFS=$'\x1f' read -r a b c d e f g h; do
+        [[ -n "$b" ]] || continue
+        VS_SRC+=("$a"); VS_NAME+=("$b"); VS_GRP+=("$c"); VS_KIND+=("$d")
+        VS_DEF+=("$e"); VS_DESC+=("$f"); VS_FILE+=("$g"); VS_ST+=("$h")
+    done < <(python3 - "$INSTALL_DIR" <<'PY' 2>/dev/null
+import ast, json, os, re, sys
+
+root = sys.argv[1]
+NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SKIP_DIRS = {".git", "__pycache__", "venv", ".venv", "env", "node_modules", "site-packages",
+             "tests", "test", "docs", "dist", "build", ".github", ".idea", ".vscode"}
+MAX_DEPTH = 5
+
+# 系统 / 运行环境自带的变量, 不需要用户填
+SYS_ENV = {"HOME", "PATH", "USER", "PWD", "LANG", "LC_ALL", "TERM", "SHELL", "HOSTNAME", "TZ",
+           "PYTHONPATH", "PYTHONUNBUFFERED", "VIRTUAL_ENV", "TMPDIR", "TEMP", "TMP", "LOGNAME",
+           "SUDO_USER", "SYSTEMD_EXEC_PID", "INVOCATION_ID", "JOURNAL_STREAM", "XDG_RUNTIME_DIR",
+           "COLUMNS", "LINES", "NO_COLOR", "FORCE_COLOR", "CI", "DYNO", "PORT_OFFSET"}
+
+RX_TG_TOKEN = re.compile(r"(^|_)BOT_TOKEN$|^TOKEN$|^TG_TOKEN$|^TELEGRAM(_BOT)?_TOKEN$|^TELEGRAM_API_TOKEN$", re.I)
+RX_ADMIN = re.compile(r"admin|owner|super_?user|allowed_?users|whitelist|white_list|(^|_)uids?$|(^|_)user_?ids?$", re.I)
+RX_IDS = re.compile(r"(^|_)ids?$|admin|owner|chat_?id|group_?id|channel_?id|allowed_?users|whitelist|(^|_)uids?$", re.I)
+RX_SECRET = re.compile(r"token|key|secret|pass(wd|word)?$|pwd$|credential|cookie|session|auth", re.I)
+RX_PORT = re.compile(r"(^|_)port$", re.I)
+RX_URL = re.compile(r"(url|uri|endpoint|host|domain|proxy|base)$", re.I)
+RX_ADV = re.compile(r"(dir|path|file|folder|conf|config|log|debug|level|timeout|interval|retries|retry|"
+                    r"workers?|threads?|cache|ttl|lang|locale|timezone|tz|mode|env|environment)$", re.I)
+RX_PLACEHOLDER = re.compile(r"your|xxx|change_?me|placeholder|replace|在此|填写|替换|请填|待填|示例|example|"
+                            r"^<.*>$|^\*+$|^0+$|^123456|abcdef|^todo$|^none$|^null$|^-$", re.I)
+RX_PY_CAND = re.compile(r"token|api_?key|secret|password|passwd|admin|owner|(^|_)ids?$|chat_?id|"
+                        r"channel|group_?id|webhook|cookie|proxy|(^|_)port$|key$", re.I)
+
+
+def files_in(root, exts):
+    out = []
+    base = root.rstrip(os.sep).count(os.sep)
+    for dp, dn, fn in os.walk(root):
+        dn[:] = sorted(d for d in dn if d not in SKIP_DIRS and not d.startswith("."))
+        if dp.count(os.sep) - base >= MAX_DEPTH:
+            dn[:] = []
+        for f in sorted(fn):
+            if f.endswith(exts):
+                out.append(os.path.join(dp, f))
+    return out
+
+
+def is_placeholder(v):
+    if v is None:
+        return True
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float)):
+        return v == 0 or bool(re.match(r"^-?(100)?123456", str(v)))
+    if isinstance(v, (list, tuple, set)):
+        return len(v) == 0 or all(is_placeholder(x) for x in v)
+    if isinstance(v, dict):
+        return False
+    s = str(v).strip()
+    return s == "" or bool(RX_PLACEHOLDER.search(s))
+
+
+def kind_of(name, hint=""):
+    if RX_PORT.search(name):
+        return "port"
+    if RX_TG_TOKEN.search(name):
+        return "token"
+    if RX_IDS.search(name) and not re.search(r"token|key|secret|url", name, re.I):
+        return "ids"
+    if RX_SECRET.search(name):
+        return "secret"
+    if hint in ("num", "bool", "ids"):
+        return hint
+    if RX_URL.search(name):
+        return "url"
+    return "str"
+
+
+# ------------------------------------------------------------------ 1. 环境变量 (代码)
+env = {}   # name -> dict(req, default, has_default, kind_hint, files)
+
+
+def add_env(name, has_default, default, hint, path, force_req=False):
+    if not NAME.match(name) or name in SYS_ENV:
+        return
+    e = env.setdefault(name, {"req": False, "nodef": False, "default": "", "hint": "", "files": set(),
+                              "forced": False, "desc": ""})
+    if not has_default or RX_TG_TOKEN.search(name) or RX_ADMIN.search(name) and RX_IDS.search(name):
+        e["nodef"] = True
+    if isinstance(default, list):
+        default = ",".join(str(x) for x in default)
+    if has_default and default not in ("", None) and not e["default"]:
+        e["default"] = str(default)
+    if hint and not e["hint"]:
+        e["hint"] = hint
+    if force_req:
+        e["forced"] = True
+    e["files"].add(os.path.relpath(path, root))
+
+
+def const(n):
+    if isinstance(n, ast.Constant):
+        return True, n.value
+    if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub) and isinstance(n.operand, ast.Constant):
+        return True, -n.operand.value
+    if isinstance(n, (ast.List, ast.Tuple, ast.Set)):
+        items = [const(e) for e in n.elts]
+        if all(o for o, _ in items):
+            return True, [x for _, x in items]
+    return False, None
+
+
+py_cands = []   # (name, value, file, kind)
+json_refs = set()
+
+for path in files_in(root, (".py",)):
+    try:
+        src = open(path, encoding="utf-8", errors="ignore").read()
+        tree = ast.parse(src)
+    except (SyntaxError, OSError, ValueError):
+        continue
+    for m in re.findall(r"""["']([\w./-]+\.(?:json|ya?ml|toml|ini))["']""", src):
+        json_refs.add(os.path.basename(m))
+
+    parent = {}
+    for p in ast.walk(tree):
+        for c in ast.iter_child_nodes(p):
+            parent[c] = p
+
+    # 别名: from os import getenv as g / environ as e ; env = os.environ ; from decouple import config
+    getenv_names, environ_names, decouple_names, environs_objs = {"getenv"}, {"environ"}, set(), set()
+    settings_bases = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module:
+            for a in n.names:
+                nm = a.asname or a.name
+                if n.module == "os" and a.name == "getenv":
+                    getenv_names.add(nm)
+                elif n.module == "os" and a.name == "environ":
+                    environ_names.add(nm)
+                elif n.module.split(".")[0] == "decouple" and a.name in ("config", "AutoConfig", "Config"):
+                    decouple_names.add(nm)
+                elif n.module.split(".")[0] in ("pydantic_settings", "pydantic") and a.name == "BaseSettings":
+                    settings_bases.add(nm)
+        elif isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            d = ast.dump(n.value)
+            t = n.targets[0].id
+            if isinstance(n.value, ast.Attribute) and n.value.attr == "environ":
+                environ_names.add(t)
+            elif isinstance(n.value, ast.Attribute) and n.value.attr == "getenv":
+                getenv_names.add(t)
+            elif isinstance(n.value, ast.Call) and ("'Env'" in d or "'AutoConfig'" in d or "'Config'" in d and decouple_names):
+                if "'Env'" in d:
+                    environs_objs.add(t)
+                else:
+                    decouple_names.add(t)
+
+    def is_environ(node):
+        if isinstance(node, ast.Name):
+            return node.id in environ_names
+        if isinstance(node, ast.Attribute):
+            return node.attr == "environ"
+        return False
+
+    def wrap_hint(node):
+        p = parent.get(node)
+        for _ in range(3):
+            if p is None:
+                break
+            if isinstance(p, ast.Call) and isinstance(p.func, ast.Name):
+                if p.func.id in ("int", "float"):
+                    return "num"
+                if p.func.id == "bool":
+                    return "bool"
+            if isinstance(p, ast.Attribute) and p.attr == "split":
+                return "ids"
+            if isinstance(p, ast.Compare) or (isinstance(p, ast.Attribute) and p.attr == "lower"):
+                q = parent.get(p)
+                if isinstance(p, ast.Compare) or isinstance(q, ast.Call):
+                    return "bool"
+            p = parent.get(p)
+        return ""
+
+    def kw(call, *names):
+        for k in call.keywords:
+            if k.arg in names:
+                return k.value
+        return None
+
+    target_of = {}   # env name -> python variable it is assigned to
+    hits = []
+
+    for n in ast.walk(tree):
+        name = None
+        has_def, dflt, hint = False, None, ""
+        if isinstance(n, ast.Call) and n.args:
+            ok, a0 = const(n.args[0])
+            if not ok or not isinstance(a0, str):
+                continue
+            f = n.func
+            dv = n.args[1] if len(n.args) > 1 else kw(n, "default")
+            if isinstance(f, ast.Name) and f.id in getenv_names:
+                name = a0
+            elif isinstance(f, ast.Attribute) and f.attr == "getenv":
+                name = a0
+            elif isinstance(f, ast.Attribute) and f.attr in ("get", "setdefault") and is_environ(f.value):
+                name = a0
+            elif isinstance(f, ast.Name) and f.id in decouple_names:
+                name = a0
+                dv = kw(n, "default")
+                cast = kw(n, "cast")
+                if isinstance(cast, ast.Name):
+                    hint = {"int": "num", "float": "num", "bool": "bool"}.get(cast.id, "")
+            elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in environs_objs:
+                name = a0
+                hint = {"int": "num", "float": "num", "bool": "bool", "list": "ids"}.get(f.attr, "")
+            elif isinstance(f, ast.Name) and f.id in environs_objs:
+                name = a0
+            if name is None:
+                continue
+            if dv is not None:
+                has_def = True
+                okd, dflt = const(dv)
+                if not okd:
+                    dflt = "(由代码计算)"
+            hint = hint or wrap_hint(n)
+        elif isinstance(n, ast.Subscript) and is_environ(n.value) and isinstance(n.ctx, ast.Load):
+            ok, a0 = const(n.slice)
+            if not ok or not isinstance(a0, str):
+                continue
+            name, hint = a0, wrap_hint(n)
+        else:
+            continue
+        hits.append((n, name, has_def, dflt, hint))
+
+    node_name = {id(h[0]): h[1] for h in hits}
+
+    def inner_name(v):  # BoolOp 里的一项 (可能套了 .strip() 之类) 对应的环境变量名
+        for x in ast.walk(v):
+            if id(x) in node_name:
+                return node_name[id(x)]
+        return None
+
+    for n, name, has_def, dflt, hint in hits:
+        # A or B or "默认值": 后面还有备选 = 有默认值; 同一串里的其他环境变量 = 备用名称
+        c, p, alt = n, parent.get(n), None
+        for _ in range(3):
+            if isinstance(p, (ast.Attribute, ast.Call)) and not isinstance(p, ast.BoolOp):
+                c, p = p, parent.get(p)
+            else:
+                break
+        if isinstance(p, ast.BoolOp) and isinstance(p.op, ast.Or) and c in p.values:
+            i = p.values.index(c)
+            if i < len(p.values) - 1:
+                has_def = True
+                okd, d = const(p.values[-1])
+                dflt = d if okd else (dflt if dflt not in (None, "") else "(由代码计算)")
+            for v in p.values:
+                first = inner_name(v)
+                if first:
+                    if first != name:
+                        alt = first
+                    break
+        add_env(name, has_def, dflt, hint, path)
+        if name not in env:
+            continue
+        if alt:
+            env[name].setdefault("alt", alt)
+        else:
+            env[name]["primary"] = True
+        # 记录赋值目标, 用来判断 "没填就退出" 的写法
+        p = n
+        for _ in range(4):
+            p = parent.get(p)
+            if p is None:
+                break
+            if isinstance(p, ast.Assign) and len(p.targets) == 1 and isinstance(p.targets[0], (ast.Name, ast.Attribute)):
+                t = p.targets[0]
+                target_of.setdefault(t.id if isinstance(t, ast.Name) else t.attr, set()).add(name)
+                break
+            if isinstance(p, ast.AnnAssign) and isinstance(p.target, ast.Name):
+                target_of.setdefault(p.target.id, set()).add(name)
+                break
+
+    # pydantic BaseSettings: 字段名就是环境变量名
+    for c in ast.walk(tree):
+        if not isinstance(c, ast.ClassDef):
+            continue
+        bases = {b.id if isinstance(b, ast.Name) else getattr(b, "attr", "") for b in c.bases}
+        if not (bases & (settings_bases | {"BaseSettings"})):
+            continue
+        prefix = ""
+        for st in c.body:
+            d = ast.dump(st)
+            m = re.search(r"env_prefix'?, value=Constant\(value='([^']*)'", d) or \
+                re.search(r"arg='env_prefix', value=Constant\(value='([^']*)'", d)
+            if m:
+                prefix = m.group(1)
+            if isinstance(st, ast.ClassDef) and st.name == "Config":
+                for s2 in st.body:
+                    if isinstance(s2, ast.Assign) and any(getattr(t, "id", "") == "env_prefix" for t in s2.targets):
+                        ok, v = const(s2.value)
+                        if ok:
+                            prefix = v
+        for st in c.body:
+            if not (isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name)):
+                continue
+            fname = st.target.id
+            if fname.startswith("_") or fname == "model_config":
+                continue
+            ann = ast.dump(st.annotation)
+            hint = "num" if "'int'" in ann or "'float'" in ann else "bool" if "'bool'" in ann else \
+                   "ids" if "'list'" in ann or "'List'" in ann or "'set'" in ann else ""
+            ename = (prefix + fname).upper()
+            v = st.value
+            has_def, dflt = False, None
+            if v is not None:
+                if isinstance(v, ast.Call) and getattr(v.func, "id", getattr(v.func, "attr", "")) == "Field":
+                    al = kw(v, "alias", "validation_alias", "env")
+                    ok, a = const(al) if al is not None else (False, None)
+                    if ok and isinstance(a, str):
+                        ename = a
+                    dv = v.args[0] if v.args else kw(v, "default")
+                    if dv is not None and not (isinstance(dv, ast.Constant) and dv.value is Ellipsis):
+                        has_def = True
+                        ok, dflt = const(dv)
+                        if not ok:
+                            dflt = "(由代码计算)"
+                    elif kw(v, "default_factory") is not None:
+                        has_def, dflt = True, "(由代码计算)"
+                else:
+                    has_def = True
+                    ok, dflt = const(v)
+                    if not ok:
+                        dflt = "(由代码计算)"
+            add_env(ename, has_def, dflt, hint, path)
+
+    # "没填就退出": if not X: sys.exit / raise / exit
+    def exits(body):
+        for s in body:
+            for x in ast.walk(s):
+                if isinstance(x, ast.Raise):
+                    return True
+                if isinstance(x, ast.Call):
+                    fn = x.func
+                    nm = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+                    if nm in ("exit", "_exit", "quit", "SystemExit"):
+                        return True
+        return False
+
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.If) or not exits(n.body):
+            continue
+        for x in ast.walk(n.test):
+            vname = None
+            if isinstance(x, ast.UnaryOp) and isinstance(x.op, ast.Not):
+                o = x.operand
+                vname = o.id if isinstance(o, ast.Name) else getattr(o, "attr", None)
+            elif isinstance(x, ast.Compare) and any(isinstance(op, (ast.Is, ast.Eq)) for op in x.ops):
+                o = x.left
+                vname = o.id if isinstance(o, ast.Name) else getattr(o, "attr", None)
+            elif isinstance(x, ast.Call) and isinstance(x.func, ast.Name) and x.func.id in ("all", "any"):
+                for el in ast.walk(x):
+                    if isinstance(el, ast.Name) and el.id in target_of:
+                        for en in target_of[el.id]:
+                            if en in env:
+                                env[en]["forced"] = True
+            if vname and vname in target_of:
+                for en in target_of[vname]:
+                    if en in env:
+                        env[en]["forced"] = True
+
+    # ------------------------------------------------------------ 2. 直接写在代码里的配置 (模块顶层常量)
+    rel = os.path.relpath(path, root)
+    for st in tree.body:
+        tname, v = None, None
+        if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            tname, v = st.targets[0].id, st.value
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+            tname, v = st.target.id, st.value
+        if not tname or not RX_PY_CAND.search(tname):
+            continue
+        if not (tname.isupper() or tname[:1].isupper()):
+            continue
+        d = ast.dump(v)
+        if "environ" in d or "getenv" in d or "config" in d.lower() and "Call" in d:
+            continue
+        ok, val = const(v)
+        if not ok:
+            if isinstance(v, (ast.List, ast.Tuple, ast.Set)):
+                items = [const(e) for e in v.elts]
+                if all(o for o, _ in items):
+                    ok, val = True, [x for _, x in items]
+        if not ok or isinstance(val, bool) or isinstance(val, bytes):
+            continue
+        k = kind_of(tname, "ids" if isinstance(val, list) else "num" if isinstance(val, int) else "")
+        py_cands.append((tname, val, rel, k))
+
+# ------------------------------------------------------------------ 3. .env.example 等示例文件
+example_desc = {}
+EX_NAMES = [".env.example", ".env.sample", ".env.template", ".env.dist", ".env.default", ".env.defaults",
+            "env.example", "example.env", "sample.env", ".env.local.example", "env.sample"]
+for exn in EX_NAMES:
+    p = os.path.join(root, exn)
+    if not os.path.isfile(p):
+        continue
+    pending = []
+    for line in open(p, encoding="utf-8", errors="ignore"):
+        s = line.strip()
+        if not s:
+            pending = []
+            continue
+        if s.startswith("#"):
+            t = s.lstrip("#").strip()
+            m = re.match(r"^(export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", t)
+            if m:   # 被注释掉的变量 = 可选
+                nm = m.group(2)
+                if nm not in env and nm not in SYS_ENV:
+                    env[nm] = {"req": False, "nodef": False, "default": "", "hint": "", "files": {exn},
+                               "forced": False, "desc": " ".join(pending)}
+                pending = []
+            elif t:
+                pending.append(t)
+            continue
+        m = re.match(r"^(export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", s)
+        if not m:
+            pending = []
+            continue
+        nm, val = m.group(2), m.group(3)
+        inline = ""
+        if " #" in val:
+            val, inline = val.split(" #", 1)
+        val = val.strip().strip("'\"")
+        desc = " ".join(pending + ([inline.strip()] if inline.strip() else []))
+        pending = []
+        if nm in SYS_ENV:
+            continue
+        mark_opt = bool(re.search(r"可选|选填|optional|非必|不填", desc, re.I))
+        mark_req = bool(re.search(r"必填|必须|required|mandatory", desc, re.I))
+        e = env.get(nm)
+        if e is None:
+            e = env[nm] = {"req": False, "nodef": is_placeholder(val), "default": "" if is_placeholder(val) else val,
+                           "hint": "", "files": {exn}, "forced": False, "desc": ""}
+        else:
+            e["files"].add(exn)
+            if not e["default"] and not is_placeholder(val):
+                e["default"] = val
+        if desc:
+            e["desc"] = desc
+        if mark_req:
+            e["forced"] = True
+        if mark_opt:
+            e["nodef"] = False
+            e["forced"] = False
+    break
+
+# ------------------------------------------------------------------ 当前 .env 里已经填了什么
+cur = {}
+envf = os.path.join(root, ".env")
+if os.path.isfile(envf):
+    for line in open(envf, encoding="utf-8", errors="ignore"):
+        m = re.match(r"^\s*(export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line.rstrip("\n"))
+        if m:
+            cur[m.group(2)] = m.group(3).strip().strip("'\"")
+
+
+def clean(s):
+    return re.sub(r"[\t\r\n\x1f]+", " ", str(s))[:120]
+
+
+out = []
+for nm in sorted(env):
+    e = env[nm]
+    k = kind_of(nm, e["hint"])
+    req = e["forced"] or e["nodef"]
+    if e.get("alt") and not e.get("primary") and e["alt"] in env:
+        grp = "adv"
+        if not e["desc"]:
+            e["desc"] = "%s 的备用名称（填了 %s 就不用填）" % (e["alt"], e["alt"])
+    elif k == "port":
+        grp = "req"           # 端口总要分配, 避免和其他机器人撞车
+    elif req:
+        grp = "req"
+    elif RX_ADV.search(nm) and k not in ("token", "secret", "ids"):
+        grp = "adv"
+    else:
+        grp = "opt"
+    st = "set" if cur.get(nm, "") != "" else "unset"
+    if grp == "req" and k in ("token", "ids"):
+        e["default"] = ""      # Token / 管理员 ID 不能靠默认值
+    out.append(["env", nm, grp, k, clean(e["default"]), clean(e["desc"]), ",".join(sorted(e["files"]))[:80], st])
+
+# 代码常量: 已经用环境变量的项目只列出占位符 (还没填) 的
+env_names_upper = {n.upper() for n in env}
+seen = set()
+for nm, val, rel, k in py_cands:
+    if (nm, rel) in seen or nm.upper() in env_names_upper:
+        continue
+    seen.add((nm, rel))
+    ph = is_placeholder(val)
+    if env:
+        continue        # 项目用环境变量读配置, 代码里的常量只是备用值
+    if not ph and k in ("str", "url", "num", "port"):
+        continue        # 已经有正常值的普通配置, 不打扰
+    if isinstance(val, list):
+        shown = " ".join(str(x) for x in val)
+    else:
+        shown = "" if val is None else str(val)
+    grp = "req" if ph and k in ("token", "ids", "secret") else "opt"
+    out.append(["py", nm, grp, k, clean(shown if not ph else ""), "", rel, "unset" if ph else "set"])
+
+# ------------------------------------------------------------------ 4. JSON 配置文件
+CFG_EX = re.compile(r"^(.+?)[._-](example|sample|template|dist|default)(\.json)?$", re.I)
+for f in sorted(os.listdir(root)):
+    p = os.path.join(root, f)
+    if not os.path.isfile(p):
+        continue
+    m = CFG_EX.match(f)
+    if m and (f.endswith(".json") or m.group(1).endswith(".json")):
+        tgt = m.group(1) if m.group(1).endswith(".json") else m.group(1) + ".json"
+        out.append(["cfgex", tgt, "req", "file", "", "", f, "set" if os.path.exists(os.path.join(root, tgt)) else "unset"])
+    elif m and re.search(r"\.(ya?ml|toml|ini|cfg)$", m.group(1) + (m.group(3) or ""), re.I):
+        tgt = m.group(1)
+        out.append(["cfgother", tgt, "req", "file", "", "", f, "set" if os.path.exists(os.path.join(root, tgt)) else "unset"])
+    elif re.search(r"\.(ya?ml|toml|ini|cfg)\.(example|sample|template|dist)$", f, re.I):
+        tgt = f.rsplit(".", 1)[0]
+        out.append(["cfgother", tgt, "req", "file", "", "", f, "set" if os.path.exists(os.path.join(root, tgt)) else "unset"])
+
+json_files = set(r[1] for r in out if r[0] == "cfgex")
+for f in sorted(os.listdir(root)):
+    if f.endswith(".json") and f in json_refs and f not in ("package.json", "package-lock.json", "tsconfig.json"):
+        json_files.add(f)
+
+
+def walk_json(o, pfx):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if not isinstance(k, str) or not re.match(r"^[A-Za-z0-9_-]+$", k):
+                continue
+            yield from walk_json(v, pfx + [k])
+    else:
+        yield pfx, o
+
+
+for f in sorted(json_files):
+    p = os.path.join(root, f)
+    src = p if os.path.exists(p) else None
+    if src is None:
+        for r in out:
+            if r[0] == "cfgex" and r[1] == f:
+                src = os.path.join(root, r[6])
+    try:
+        data = json.load(open(src, encoding="utf-8"))
+    except Exception:
+        continue
+    if not isinstance(data, dict):
+        continue
+    for path, v in walk_json(data, []):
+        if not path:
+            continue
+        leaf = path[-1]
+        if not RX_PY_CAND.search(leaf) and not is_placeholder(v):
+            continue
+        if isinstance(v, (dict, bool)) or (isinstance(v, list) and v and not all(isinstance(x, (int, str)) for x in v)):
+            continue
+        k = kind_of(leaf, "ids" if isinstance(v, list) else "num" if isinstance(v, int) and not isinstance(v, bool) else "")
+        ph = is_placeholder(v)
+        if not ph and k in ("str", "url", "num", "port"):
+            continue
+        grp = "req" if ph and (k in ("token", "ids", "secret") or v in ("", None)) else "opt"
+        shown = " ".join(str(x) for x in v) if isinstance(v, list) else ("" if v is None else str(v))
+        out.append(["json", ".".join(path), grp, k, clean("" if ph else shown), "", f, "unset" if ph else "set"])
+
+for r in out:
+    print("\x1f".join(r))
+PY
+)
+}
+
+kind_desc() {  # 没有说明时, 按类型给一句
+    case "$1" in
+        token)  echo "Telegram 机器人 Token（@BotFather 获取）" ;;
+        ids)    echo "数字 ID（多个用空格或逗号分隔；用户 ID 可找 @userinfobot 获取）" ;;
+        secret) echo "密钥 / 密码" ;;
+        port)   echo "监听端口" ;;
+        url)    echo "地址 / 链接" ;;
+        num)    echo "数字" ;;
+        bool)   echo "开关（true / false）" ;;
+        *)      echo "设置项" ;;
+    esac
+}
+
+var_info() {  # var_info 序号 : 说明文字
+    local i="$1" d="${VS_DESC[$1]}"
+    if [[ -z "$d" ]]; then
+        d="$(var_desc "${VS_NAME[i]}")"
+        [[ "$d" == *"[自动识别]" ]] && d="$(kind_desc "${VS_KIND[i]}")"
+        d="${d%% \[*\]}"; d="${d%%\[*\]}"
+    fi
+    if [[ "${VS_DEF[i]}" == "(由代码计算)" ]]; then d+="（不填时用代码里的默认设置）"
+    elif [[ -n "${VS_DEF[i]}" ]]; then d+="（代码默认：${VS_DEF[i]}）"; fi
+    echo "$d"
+}
+
+var_where() {  # 写到哪里, 给人看的
+    case "${VS_SRC[$1]}" in
+        env)  echo ".env" ;;
+        py)   echo "${VS_FILE[$1]}" ;;
+        json) echo "${VS_FILE[$1]}" ;;
+        *)    echo "${VS_FILE[$1]}" ;;
+    esac
+}
+
+tg_check_token() {  # 用 Telegram 接口验证 Token (token 不出现在命令行参数里)
+    local out
+    command -v curl >/dev/null 2>&1 || return 0
+    out="$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$1" | curl -s -m 8 -K - 2>/dev/null)"
+    if [[ "$out" == *'"ok":true'* ]]; then
+        log "Token 有效：@$(sed -n 's/.*"username":"\([^"]*\)".*/\1/p' <<<"$out")"
+        return 0
+    elif [[ "$out" == *'"ok":false'* ]]; then
+        err "Telegram 说这个 Token 无效（可能复制错了，或已在 @BotFather 里重置）。"
+        return 1
+    fi
+    warn "暂时连不上 Telegram，没法验证 Token，先照样写入。"
+    return 0
+}
+
+json_set() {  # json_set 文件 a.b.c 类型 值
+    TG_VAL="$4" python3 - "$1" "$2" "$3" <<'PY'
+import json, os, re, sys
+path, key, kind = sys.argv[1:4]
+val = os.environ["TG_VAL"]
+data = json.load(open(path, encoding="utf-8"))
+cur = data
+parts = key.split(".")
+for p in parts[:-1]:
+    cur = cur.setdefault(p, {})
+old = cur.get(parts[-1])
+if kind == "ids" or isinstance(old, list):
+    items = [x for x in re.split(r"[\s,，;；]+", val) if x]
+    new = [int(x) if re.match(r"^-?\d+$", x) else x for x in items]
+    if not isinstance(old, list) and len(new) == 1:
+        new = new[0]
+elif (kind in ("num", "port") or isinstance(old, int)) and not isinstance(old, bool) and re.match(r"^-?\d+$", val):
+    new = int(val)
+elif kind == "bool" or isinstance(old, bool):
+    new = val.lower() in ("1", "true", "yes", "on", "y")
+else:
+    new = val
+cur[parts[-1]] = new
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+    local rc=$?
+    chmod 600 "$1" 2>/dev/null
+    (( rc == 0 )) && log "已写入 $2 到 $(basename "$1")" || err "写入 $2 失败。"
+    return $rc
+}
+
+# fill_var 序号 : 按类型询问并写入一项
+fill_var() {
+    local i="$1" name="${VS_NAME[$1]}" kind="${VS_KIND[$1]}" src="${VS_SRC[$1]}" grp="${VS_GRP[$1]}"
+    local val ids id bad=0 skip="回车跳过"
+    if [[ "$src" == "env" && "$kind" == "port" ]]; then
+        fill_port_var "$name" && VARS_CHANGED=1
+        return 0
+    fi
+    echo
+    echo "  ${BOLD}${name}${RESET}  $([[ "$grp" == req ]] && echo "${YELLOW}必填${RESET}" || echo "${DIM}可选${RESET}")  ${DIM}→ $(var_where "$i")${RESET}"
+    echo "  ${DIM}$(var_info "$i")${RESET}"
+    [[ "${VS_ST[i]}" == set ]] && skip="回车保持现在的值"
+    [[ "${VS_ST[i]}" != set && -n "${VS_DEF[i]}" ]] && skip="回车使用代码默认值"
+    while true; do
+        case "$kind" in
+            token|secret) rds val "请输入（输入不显示；${skip}）" ;;
+            ids)          rd val "请输入（多个用空格或逗号分隔；${skip}）" ;;
+            *)            rd val "请输入（${skip}）" ;;
+        esac
+        if [[ -z "$val" ]]; then
+            if [[ "$grp" == req && "${VS_ST[i]}" != set && -z "${VS_DEF[i]}" ]]; then
+                warn "已跳过。这是必填项，不填机器人可能启动失败（之后可在 管理机器人 → 5 里补填）。"
+            else
+                echo "  已跳过。"
+            fi
+            return 0
+        fi
+        if [[ "$kind" == token ]]; then
+            if [[ ! "$val" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{30,}$ ]]; then
+                err "这不像 Telegram Token（格式是 数字:字母串，如 123456789:AAH...）。"
+                confirm "仍然写入？" || continue
+            elif ! tg_check_token "$val"; then
+                confirm "仍然写入？" || continue
+            fi
+        elif [[ "$kind" == ids ]]; then
+            ids="$(normalize_ids "$val")"; bad=0
+            for id in $ids; do [[ "$id" =~ ^-?[0-9]+$ ]] || bad=1; done
+            if (( bad )); then
+                if [[ "$name" =~ [Cc][Hh][Aa][Nn][Nn][Ee][Ll]|[Gg][Rr][Oo][Uu][Pp] ]]; then
+                    : # 频道 / 群组也可能填 @用户名
+                else
+                    err "ID 要是数字（多个用空格或逗号分隔），请重新输入。"; continue
+                fi
+            fi
+            val="$ids"
+        elif [[ "$kind" == num && ! "$val" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+            err "这里要填数字。"; continue
+        fi
+        break
+    done
+    case "$src" in
+        env)
+            [[ "$kind" == ids ]] && val="${val// /,}"
+            set_env_var "$INSTALL_DIR/.env" "$name" "$val" || return 1 ;;
+        py)
+            case "$kind" in
+                ids) write_value py "$INSTALL_DIR/${VS_FILE[i]}" "$name" ids list "$val" || return 1 ;;
+                num) write_value py "$INSTALL_DIR/${VS_FILE[i]}" "$name" raw raw "$val" || return 1 ;;
+                *)   write_value py "$INSTALL_DIR/${VS_FILE[i]}" "$name" str str "$val" || return 1 ;;
+            esac ;;
+        json)
+            json_set "$INSTALL_DIR/${VS_FILE[i]}" "$name" "$kind" "$val" || return 1 ;;
+    esac
+    VS_ST[i]="set"
+    VARS_CHANGED=1
+    if [[ "$kind" == token ]]; then TOKEN_VAR="$name"; save_conf; fi
+    if [[ "$kind" == ids && -z "$ID_VAR" ]]; then ID_VAR="$name"; save_conf; fi
+    return 0
+}
+
+# 示例配置文件: 复制成正式文件 (已存在就不动)
+prepare_cfg_files() {
+    local i n=0 tgt
+    for i in "${!VS_NAME[@]}"; do
+        [[ "${VS_SRC[i]}" == cfgex || "${VS_SRC[i]}" == cfgother ]] || continue
+        [[ "${VS_ST[i]}" == unset ]] || continue
+        tgt="$INSTALL_DIR/${VS_NAME[i]}"
+        [[ -e "$tgt" ]] && continue
+        cp "$INSTALL_DIR/${VS_FILE[i]}" "$tgt" || continue
+        chmod 600 "$tgt"; n=$((n + 1))
+        log "已按示例 ${VS_FILE[i]} 创建配置文件 ${VS_NAME[i]}"
+        if [[ "${VS_SRC[i]}" == cfgother ]]; then
+            warn "这个格式需要手动编辑：nano $tgt （改完重启机器人）"
+        fi
+    done
+    (( n > 0 )) && scan_all
+    return 0
+}
+
+# 自动识别并填写:  guided_fill [all]   (all = 已填的也重新问一遍)
+guided_fill() {
+    local all="${1:-}" i req=() opt=() adv=() nreq=0 n
+    command -v python3 >/dev/null 2>&1 || ensure_python || return 1
+    scan_all
+    prepare_cfg_files
+    for i in "${!VS_NAME[@]}"; do
+        case "${VS_SRC[i]}" in cfgex|cfgother) continue ;; esac
+        case "${VS_GRP[i]}" in
+            req) req+=("$i"); [[ "${VS_ST[i]}" == set ]] || nreq=$((nreq + 1)) ;;
+            opt) opt+=("$i") ;;
+            *)   adv+=("$i") ;;
+        esac
+    done
+    if (( ${#req[@]} + ${#opt[@]} + ${#adv[@]} == 0 )); then
+        warn "没有从代码里识别到需要填写的配置，改为手动指定变量名。"
+        quick_keys_legacy
+        return
+    fi
+    echo "  ${DIM}从代码中识别到：必填 ${#req[@]} 项（未填 ${nreq}）、可选 ${#opt[@]} 项、高级 ${#adv[@]} 项（一般不用改）${RESET}"
+    for i in "${req[@]}"; do
+        [[ -n "$all" || "${VS_ST[i]}" != set ]] && fill_var "$i"
+    done
+    local todo=()
+    for i in "${opt[@]}"; do [[ -n "$all" || "${VS_ST[i]}" != set ]] && todo+=("$i"); done
+    if (( ${#todo[@]} > 0 )); then
+        echo
+        echo "  ${DIM}可选项（不填也能运行，用到相关功能时再填）：${RESET}"
+        for i in "${todo[@]}"; do
+            printf '    %s  %s\n' "$(padr "${VS_NAME[i]}" 22)" "${DIM}$(var_info "$i")${RESET}"
+        done
+        if confirm "现在填写可选项？（每项都可以回车跳过）"; then
+            for i in "${todo[@]}"; do fill_var "$i"; done
+        fi
+    fi
+    n=0
+    for i in "${req[@]}"; do [[ "${VS_ST[i]}" == set || -n "${VS_DEF[i]}" ]] || n=$((n + 1)); done
+    echo
+    if (( n > 0 )); then
+        warn "还有 ${n} 个必填项没填，之后可在 管理机器人 → 5 里补填。"
+    else
+        log "必填项都已填好。"
+    fi
+}
+
+# 查看 / 修改某一项
+var_edit_menu() {
+    local c i label st
+    command -v python3 >/dev/null 2>&1 || ensure_python || return 1
+    while true; do
+        cls
+        banner "查看 / 修改配置" "$BOT_NAME"
+        scan_all
+        echo
+        local idx=() g
+        for g in req opt adv; do
+            local first=1
+            for i in "${!VS_NAME[@]}"; do
+                [[ "${VS_GRP[i]}" == "$g" ]] || continue
+                case "${VS_SRC[i]}" in cfgex|cfgother) continue ;; esac
+                if (( first )); then
+                    case $g in req) label="必填" ;; opt) label="可选" ;; *) label="高级（一般不用改）" ;; esac
+                    echo "  ${BOLD}${label}${RESET}"; first=0
+                fi
+                idx+=("$i")
+                if [[ "${VS_ST[i]}" == set ]]; then st="${GREEN}已设置${RESET}"
+                elif [[ -n "${VS_DEF[i]}" ]]; then st="${DIM}默认值${RESET}"
+                else st="${YELLOW}未设置${RESET}"; fi
+                printf '  %s) %s %s  %s\n' "${YELLOW}$(padr "${#idx[@]}" 2)${RESET}" "$(padr "${VS_NAME[i]}" 22)" "$st" "${DIM}$(var_info "$i")${RESET}"
+            done
+            (( first )) || echo
+        done
+        (( ${#idx[@]} )) || echo "  ${DIM}没有识别到配置项${RESET}"
+        echo "  ${DIM}输入编号修改；0 返回${RESET}"
+        rd c "请选择" ""
+        [[ -z "$c" || "$c" == 0 ]] && return 0
+        if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#idx[@]} )); then
+            fill_var "${idx[c-1]}"; pause
+        else
+            warn "无效选择：$c"; sleep 1
+        fi
+    done
+}
+
+# 改了配置, 机器人正在运行时问一下要不要重启
+offer_restart() {
+    (( VARS_CHANGED )) || return 0
+    VARS_CHANGED=0
+    if unit_exists && systemctl is-active --quiet "$SERVICE_NAME"; then
+        echo
+        confirm_y "配置已修改，重启机器人使其生效？" && bot_restart
+    fi
+    return 0
+}
+
+do_config() {
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        warn "目录不存在：$INSTALL_DIR，请先获取机器人代码。"
+        return 1
+    fi
+    local c
+    while true; do
+        cls
+        banner "写入密钥 / 配置" "$BOT_NAME"
+        echo
+        menu_item 1 "自动识别并填写（推荐）" "只问还没填的"
+        menu_item 2 "查看 / 修改某一项" "列出全部识别到的配置"
+        menu_item 3 "全部重新填写"
+        menu_item 4 "手动指定变量名" "识别不到时用"
+        menu_item 0 "返回"
+        echo
+        rd c "请选择"
+        case "$c" in
+            1) guided_fill; pause ;;
+            2) var_edit_menu ;;
+            3) guided_fill all; pause ;;
+            4) do_config_manual ;;
+            0) break ;;
+            *) warn "无效选择：$c"; sleep 1 ;;
+        esac
+    done
+    offer_restart
+}
+
+quick_keys() { guided_fill; }
 
 add_bot() {
     local name url branch
@@ -1471,7 +2362,7 @@ add_bot() {
     heading "安装环境（自动）"
     do_deps || warn "环境安装有问题，稍后可在「管理机器人」里选「修复依赖」。"
 
-    heading "写入密钥 / 用户ID"
+    heading "写入密钥 / 配置"
     quick_keys
 
     heading "启动机器人"
@@ -1645,7 +2536,7 @@ bot_menu() {
         menu_item 2 "停止机器人" "停止运行，不会自动重启"
         menu_item 3 "重启机器人"
         menu_item 4 "开机自启 开 / 关" "切换"
-        menu_item 5 "写入密钥 / 用户ID" "Token、管理员ID"
+        menu_item 5 "写入密钥 / 配置" "自动识别代码需要的 Token、ID、密钥"
         menu_item 6 "更新仓库代码" "有更新后可选重启"
         menu_item 7 "修复依赖" "自动检测并安装缺少的包"
         menu_item 8 "查看状态"
