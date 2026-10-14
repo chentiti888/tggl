@@ -7,7 +7,8 @@
     python3 dh.py
 改成
     python3 miniapp_api.py
-机器人照常工作；同时在 127.0.0.1:8787 开一个只给本机用的接口，
+机器人照常工作；同时在 127.0.0.1 开一个只给本机用的接口 (端口默认 8787,
+可用环境变量 MINIAPP_PORT 或配置文件里的 port 修改)，
 PHP 页面（api.php）把 Mini App 的请求转发到这里。
 
 安全：
@@ -36,7 +37,29 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dh  # noqa: E402  复用机器人里已有的全部功能
 
-CONF_FILE = os.environ.get("MINIAPP_CONF", "/root/nav_miniapp.json")
+# 数据目录和 dh.py 一致: 默认程序所在目录, 环境变量 NAV_DATA_DIR 可改; 旧的 /root 文件自动搬过来
+DATA_DIR = os.environ.get("NAV_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _data_path(name):
+    new = os.path.join(DATA_DIR, name)
+    old = os.path.join("/root", name)
+    if os.path.abspath(old) != os.path.abspath(new) and os.path.exists(old) and not os.path.exists(new):
+        try:
+            os.replace(old, new)
+            print(f"已把旧数据 {old} 移到 {new}")
+        except OSError:
+            try:
+                import shutil
+                shutil.move(old, new)
+            except Exception as e:
+                print(f"迁移旧数据 {old} 失败, 继续使用旧位置: {e}")
+                return old
+    return new
+
+
+CONF_FILE = os.environ.get("MINIAPP_CONF") or _data_path("nav_miniapp.json")
 MAX_BODY = 64 * 1024
 JOB_KEEP = 1800          # 任务结果保留 30 分钟
 JOB_PER_USER = 2         # 每人同时最多跑 2 个任务
@@ -66,6 +89,8 @@ def load_conf():
 
 
 CONF = load_conf()
+if (os.environ.get("MINIAPP_PORT") or "").strip().isdigit():   # 环境变量优先 (部署脚本分配的端口)
+    CONF["port"] = int(os.environ.get("MINIAPP_PORT").strip())
 
 # ---------------------------------------------------------------- 校验 initData
 
@@ -1040,7 +1065,7 @@ async def start_server():
 # 目标服务器上跑一个小脚本（web/probe.sh），每 5 秒把数据发到网站的 probe.php，
 # 再转给本接口的 /probe。目标机器不用开任何端口。登记的服务器保存在 SERVERS_FILE。
 
-SERVERS_FILE = CONF.get("servers_file") or "/root/nav_servers.json"
+SERVERS_FILE = CONF.get("servers_file") or _data_path("nav_servers.json")
 SERVER_LIMIT = 60
 OFFLINE_AFTER = 30          # 超过这么多秒没收到数据就算离线
 SERVERS = []                # [{"id","name","token","created"}]

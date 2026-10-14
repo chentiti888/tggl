@@ -43,7 +43,28 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-CONFIG_FILE = os.environ.get("NAV_BOT_CONFIG", "/root/nav_bot_config.json")
+# ---------------------------------------------------------------- 数据目录
+# 机器人的所有数据 (配置、导航数据、首页图片、IP 库、更新备份...) 都放在同一个目录:
+#   默认 = 程序所在目录; 也可以用环境变量 NAV_DATA_DIR 指定。
+# 旧版本放在 /root 下的同名文件, 第一次运行时自动搬过来, 数据不丢。
+DATA_DIR = os.environ.get("NAV_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _data_path(name):
+    new = os.path.join(DATA_DIR, name)
+    old = os.path.join("/root", name)
+    if os.path.abspath(old) != os.path.abspath(new) and os.path.exists(old) and not os.path.exists(new):
+        try:
+            shutil.move(old, new)
+            print(f"已把旧数据 {old} 移到 {new}")
+        except Exception as e:
+            print(f"迁移旧数据 {old} 失败, 继续使用旧位置: {e}")
+            return old
+    return new
+
+
+CONFIG_FILE = os.environ.get("NAV_BOT_CONFIG") or _data_path("nav_bot_config.json")
 CONFIG_TEMPLATE = {
     "bot_token": "",
     "admin_ids": [],
@@ -79,7 +100,7 @@ ADMIN_IDS = [
     )
     if x.strip().isdigit()
 ]
-DATA_FILE = "/root/nav_data.json"
+DATA_FILE = _data_path("nav_data.json")
 DEFAULT_DATA = {
     "categories": {
         "AI工具": [
@@ -466,10 +487,10 @@ def home_text(welcome=False, user_id=None):
             pass
     return "\n".join(lines)
 
-HOME_BANNER_FILE = "/root/nav_home_banner.jpg"
+HOME_BANNER_FILE = _data_path("nav_home_banner.jpg")
 
 def home_banner():
-    """首页顶部图片：放在服务器 /root/nav_home_banner.jpg；没有这个文件就返回 None。"""
+    """首页顶部图片：放在数据目录下的 nav_home_banner.jpg（默认和 dh.py 同一个目录）；没有这个文件就返回 None。"""
     try:
         with open(HOME_BANNER_FILE, "rb") as f:
             return f.read()
@@ -2907,7 +2928,7 @@ def _ping_points(results):
         })
     return points
 
-PROVINCE_GEO_FILE = "/root/china_provinces.json"
+PROVINCE_GEO_FILE = _data_path("china_provinces.json")
 PROVINCE_GEO_URLS = [
     # 阿里云 DataV 的全国省级边界（标准 GeoJSON）
     "https://geo.datav.aliyun.com/areas_v3/bound/100000_full.json",
@@ -3200,7 +3221,7 @@ def _render_ping_map(results):
     buffer = io.BytesIO()
     canvas.save(buffer, format="JPEG", quality=88)
     return buffer.getvalue()
-IP2REGION_FILE = "/root/ip2region_v4.xdb"
+IP2REGION_FILE = _data_path("ip2region_v4.xdb")
 IP2REGION_URLS = [
     "https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb",
     "https://cdn.jsdelivr.net/gh/lionsoul2014/ip2region@master/data/ip2region_v4.xdb",
@@ -3625,7 +3646,7 @@ def _parse_global_ping_input(text):
     elif not port:
         port = GLOBAL_PING_DEFAULT_PORT
     return host, (int(port) if port else None), proto
-GPING_RECENT_FILE = "/root/nav_gping_recent.json"
+GPING_RECENT_FILE = _data_path("nav_gping_recent.json")
 GPING_RECENT_MAX = 10  # 最近记录最多保存 10 条（四个功能共用）
 
 def _load_gping_recent():
@@ -6964,8 +6985,8 @@ async def show_server_status(query):
 import sys as _sys
 import difflib as _difflib
 SCRIPT_PATH = os.path.abspath(__file__)
-UPDATE_BACKUP_DIR = "/root/nav_bot_backups"
-UPDATE_STATE_FILE = "/root/nav_update_state.json"
+UPDATE_BACKUP_DIR = _data_path("nav_bot_backups")
+UPDATE_STATE_FILE = _data_path("nav_update_state.json")
 UPDATE_KEEP = 5
 _RESTART = {"go": False}
 

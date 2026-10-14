@@ -951,7 +951,75 @@ PY
 
 # 变量名是否像密钥 / ID（用来筛掉路径、开关之类的普通变量）
 is_secret_name() {
-    [[ "$1" =~ (KEY|TOKEN|SECRET|PASS|PASSWD|PASSWORD|API|CREDENTIAL|(^|_)IDS?$) ]]
+    [[ "$1" =~ (KEY|TOKEN|SECRET|PASS|PASSWD|PASSWORD|API|CREDENTIAL|(^|_)IDS?$) ]] || is_port_name "$1"
+}
+
+# ---------------------------------------------------------------- 端口
+# 代码里从环境变量读取的端口 (变量名以 PORT 结尾): 部署时填写或回车随机分配,
+# 和本机正在监听的端口、其他机器人 .env 里的端口都不能重复
+is_port_name() { [[ "$1" =~ (^|_)PORT$ ]]; }
+
+port_listening() {  # 本机是否已有程序在监听这个端口
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+    else
+        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+    fi
+}
+
+port_owner() {  # 哪个机器人 (不含当前这个) 的 .env 里用了这个端口
+    local p="$1" f n d
+    [[ -d "$CONF_DIR" ]] || return 0
+    for f in "$CONF_DIR"/*.conf; do
+        [[ -f "$f" ]] || continue
+        n="$(basename "$f" .conf)"
+        d="$( INSTALL_DIR=""; source "$f" 2>/dev/null; echo "$INSTALL_DIR" )"
+        [[ -n "$d" && "$d" != "$INSTALL_DIR" && -f "$d/.env" ]] || continue
+        if grep -qE "^[A-Za-z0-9_]*PORT=[\"']?${p}[\"']?\$" "$d/.env"; then echo "$n"; return 0; fi
+    done
+    return 0
+}
+
+port_random() {  # 随机挑一个没人用的端口 (20000-59999)
+    local p i
+    for ((i = 0; i < 200; i++)); do
+        p=$(( 20000 + RANDOM % 40000 ))
+        port_listening "$p" && continue
+        [[ -n "$(port_owner "$p")" ]] && continue
+        echo "$p"; return 0
+    done
+    return 1
+}
+
+fill_port_var() {  # fill_port_var 变量名 : 填写端口, 回车随机, 冲突就重新输入
+    local name="$1" cur val owner
+    cur="$(sed -n "s/^${name}=//p" "$INSTALL_DIR/.env" 2>/dev/null | tr -d "\"'" | head -1)"
+    echo
+    echo "  ${BOLD}${name}${RESET}"
+    echo "  ${DIM}$(var_desc "$name")${RESET}"
+    [[ -n "$cur" ]] && echo "  ${DIM}当前: ${cur}（直接回车保持不变）${RESET}"
+    while true; do
+        rd val "端口（1024-65535；直接回车$([[ -n "$cur" ]] && echo 保持不变 || echo 随机分配)）"
+        if [[ -z "$val" ]]; then
+            if [[ -n "$cur" ]]; then echo "  保持 ${cur}"; return 0; fi
+            val="$(port_random)" || { err "没找到可用的随机端口，请手动输入。"; continue; }
+            echo "  已随机分配端口：${GREEN}${val}${RESET}"
+        fi
+        if [[ ! "$val" =~ ^[0-9]+$ ]] || (( val < 1024 || val > 65535 )); then
+            err "端口要是 1024-65535 之间的数字。"; continue
+        fi
+        [[ "$val" == "$cur" ]] && { echo "  端口没变。"; return 0; }
+        owner="$(port_owner "$val")"
+        if [[ -n "$owner" ]]; then
+            err "端口 ${val} 已被机器人「${owner}」使用，请换一个（或直接回车随机分配）。"; continue
+        fi
+        if port_listening "$val"; then
+            err "端口 ${val} 已被本机其他程序占用（查看: ss -ltnp | grep :${val}），请换一个。"; continue
+        fi
+        break
+    done
+    write_value env "$INSTALL_DIR/.env" "$name" str str "$val"
+    echo "  ${YELLOW}提示:${RESET} 如果有网页 / 其他程序要连这个端口（比如 Mini App 的 PHP 转发地址），记得改成 ${val}"
 }
 
 # 变量说明：这个变量是哪个 API / 服务的密钥
@@ -963,6 +1031,9 @@ var_desc() {
         ABUSEIPDB_KEY)     echo "AbuseIPDB API 密钥（abuseipdb.com，IP 信誉/滥用查询）[可选]" ;;
         IPAPI_IS_KEY)      echo "ipapi.is API 密钥（ipapi.is，IP 信息查询）[可选]" ;;
         PROXYCHECK_KEY)    echo "proxycheck.io API 密钥（代理 / VPN 检测）[可选]" ;;
+        MINIAPP_PORT)      echo "Mini App 接口端口（只在本机 127.0.0.1 监听，给网页转发用）[回车随机]" ;;
+        CALLBACK_PORT)     echo "回调接收端口（给网页 / 其他程序回调用）[回车随机]" ;;
+        *PORT)             echo "${1%_PORT} 监听端口 [回车随机]" ;;
         *)
             local base="$1"
             base="${base%_API_KEY}"; base="${base%_API_TOKEN}"; base="${base%_KEY}"
@@ -980,6 +1051,7 @@ env_is_set() {
 # 依次询问并写入一个环境变量
 fill_env_var() {
     local name="$1" desc val id ids bad=0
+    is_port_name "$name" && { fill_port_var "$name"; return; }
     desc="$(var_desc "$name")"
     echo
     echo "  ${BOLD}${name}${RESET}"
@@ -1321,12 +1393,18 @@ quick_keys() {
     cfg_ids "$mode" "$file"
 
     # 代码里还有其他 API 密钥时，提示是否现在填写
-    local extra=() n
+    local extra=() ports=() n
     scan_secret_vars
     for n in "${SECRET_VARS[@]}"; do
         [[ "$n" == "$TOKEN_VAR" || "$n" == "$ID_VAR" ]] && continue
+        if is_port_name "$n"; then env_is_set "$n" || ports+=("$n"); continue; fi
         env_is_set "$n" || extra+=("$n")
     done
+    if [[ "$mode" == "env" ]] && (( ${#ports[@]} > 0 )); then
+        echo
+        echo "  ${DIM}代码需要监听端口：${ports[*]}（同一台服务器上的机器人不能用同一个端口）${RESET}"
+        for n in "${ports[@]}"; do fill_port_var "$n"; done
+    fi
     if [[ "$mode" == "env" ]] && (( ${#extra[@]} > 0 )); then
         echo
         echo "  ${DIM}代码里还支持这些可选 API 密钥：${extra[*]}${RESET}"
@@ -1605,6 +1683,44 @@ bot_menu() {
     done
 }
 
+# ---------------------------------------------------------------- 快捷命令 tgbot
+# 第一次运行时安装 /usr/local/bin/tgbot, 以后在 SSH 里输入 tgbot 就能打开本菜单。
+# tgbot 每次都会拉取仓库里最新的脚本再运行 (和那条 curl 命令效果一样), 拉取失败就用上次保存的版本。
+CMD_BIN=/usr/local/bin/tgbot
+CMD_CACHE=/usr/local/lib/tgbot/tg-bot-gl.sh
+SCRIPT_URL="https://raw.githubusercontent.com/chentiti888/tggl/main/tg-bot-gl.sh"
+
+install_cmd() {
+    [[ $EUID -eq 0 ]] || return 0
+    if [[ -e "$CMD_BIN" ]]; then
+        grep -q 'tgbot-launcher' "$CMD_BIN" 2>/dev/null || return 0   # 同名的别的程序, 不覆盖
+        return 0
+    fi
+    mkdir -p "${CMD_CACHE%/*}"
+    cat >"$CMD_BIN" <<EOF
+#!/usr/bin/env bash
+# tgbot-launcher: 每次运行都拉取仓库最新的 tg-bot-gl.sh, 拉取失败就用上次保存的版本
+URL="$SCRIPT_URL"
+CACHE="$CMD_CACHE"
+mkdir -p "\${CACHE%/*}"
+tmp=\$(mktemp)
+if curl -fsSL --max-time 15 -H 'Cache-Control: no-cache' "\$URL?t=\$(date +%s)" -o "\$tmp" 2>/dev/null \\
+   && head -1 "\$tmp" | grep -q bash && bash -n "\$tmp" 2>/dev/null; then
+    mv -f "\$tmp" "\$CACHE"
+else
+    rm -f "\$tmp"
+    [[ -f "\$CACHE" ]] || { echo "下载失败, 请检查网络: \$URL" >&2; exit 1; }
+    echo "(获取最新版失败, 使用本地保存的版本)" >&2
+fi
+exec bash "\$CACHE" "\$@"
+EOF
+    chmod 755 "$CMD_BIN"
+    echo
+    log "已安装快捷命令：以后在 SSH 里输入 ${GREEN}tgbot${RESET} 就能打开本菜单"
+    sleep 2
+}
+install_cmd
+
 # ---------------------------------------------------------------- 主菜单
 
 while true; do
@@ -1613,6 +1729,7 @@ while true; do
     banner "Telegram Bot Manager" "服务器 IP: ${SERVER_IP:-未知}"
     echo
     echo "  $(lab 目录)${#DIRS[@]} 个    $(lab 机器人)${#BOTS[@]} 个"
+    [[ -x "$CMD_BIN" ]] && echo "  ${DIM}快捷命令：tgbot${RESET}"
     echo
     menu_item 1 "创建安装目录" "默认 /root/mybot，回车即可"
     menu_item 2 "添加机器人" "仓库拉取→装依赖→密钥→启动自启"

@@ -14,6 +14,14 @@ bash <(curl -fsSL -H 'Cache-Control: no-cache' "https://raw.githubusercontent.co
 
 > 命令里的 `?t=$(date +%s)` 和 `Cache-Control` 是为了避免 GitHub 缓存拿到旧版本，更新脚本后尤其有用。
 
+第一次运行后会自动安装快捷命令 **`tgbot`**，以后在 SSH 里直接输入：
+
+```bash
+tgbot
+```
+
+`tgbot` 每次运行都会先拉取仓库里最新的脚本（效果和上面那条命令一样）；网络不通时自动使用上次保存的版本。不想要了可以删除：`rm -f /usr/local/bin/tgbot`。
+
 也可以在命令末尾直接带上机器人仓库地址，新增机器人时就不用再输入：
 
 ```bash
@@ -78,6 +86,14 @@ bash <(curl -fsSL -H 'Cache-Control: no-cache' "https://raw.githubusercontent.co
 - Token 输入时不显示，写入前只显示打码后的内容，格式不标准时会提示确认。
 - 用户ID 支持空格或逗号分隔，必须是数字。
 - 也可以用「自定义变量」写入任意字符串或数字类变量。
+
+### 端口（自动检测）
+
+代码里从环境变量读取、名字以 `PORT` 结尾的变量（如 `MINIAPP_PORT`、`CALLBACK_PORT`），部署时会单独询问：
+
+- 直接回车：随机分配一个没被占用的端口（20000-59999）。
+- 手动输入：如果本机已有程序在用，或已被其他机器人的 `.env` 占用，会提示「端口已被使用」并让你重新输入。
+- 端口写入 `.env`。如果有网页要连这个端口（比如 Mini App 的 PHP 转发地址），记得改成同一个端口。
 
 ## 开机自启
 
