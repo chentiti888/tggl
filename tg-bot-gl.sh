@@ -2610,7 +2610,47 @@ EOF
     log "已安装快捷命令：以后在 SSH 里输入 ${GREEN}tgbot${RESET} 就能打开本菜单"
     sleep 2
 }
+# ---------------------------------------------------------------- 自动导入已有机器人
+# 本脚本创建的服务 (Description=Telegram Bot (名称)) 如果不在列表里 (比如用 wsm 全量备份搬到了新服务器),
+# 自动加回列表, 菜单里就能直接管理, 不用重新部署
+import_bots() {
+    local f name wd ex main n=0
+    has_systemd || return 0
+    for f in /etc/systemd/system/*.service; do
+        [[ -f "$f" ]] || continue
+        grep -q '^Description=Telegram Bot (' "$f" || continue
+        name="$(basename "$f" .service)"
+        [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || continue
+        [[ -f "$CONF_DIR/$name.conf" ]] && continue
+        wd="$(sed -n 's/^WorkingDirectory=//p' "$f" | head -1)"
+        [[ -n "$wd" && -d "$wd" ]] || continue
+        ex="$(sed -n 's/^ExecStart=//p' "$f" | head -1)"
+        main="${ex##* }"
+        (
+            reset_defaults
+            BOT_NAME="$name"; SERVICE_NAME="$name"; INSTALL_DIR="$wd"; MAIN_PY="$main"
+            CONF_FILE="$CONF_DIR/$name.conf"
+            if [[ -d "$wd/.git" ]] && command -v git >/dev/null 2>&1; then
+                SOURCE="repo"
+                REPO_URL="$(git -C "$wd" remote get-url origin 2>/dev/null)"
+                BRANCH="$(git -C "$wd" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+                [[ "$BRANCH" == HEAD ]] && BRANCH=""
+            else
+                SOURCE="local"
+            fi
+            save_conf
+        )
+        mkdir -p "$CONF_DIR"
+        grep -qxF -- "$wd" "$DIRS_FILE" 2>/dev/null || echo "$wd" >> "$DIRS_FILE"
+        n=$((n + 1))
+        log "已导入机器人「$name」（$wd）"
+    done
+    (( n > 0 )) && sleep 2
+    return 0
+}
+
 install_cmd
+import_bots
 
 # ---------------------------------------------------------------- 主菜单
 
