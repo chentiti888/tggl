@@ -1541,6 +1541,13 @@ def const(n):
 
 py_cands = []   # (name, value, file, kind)
 json_refs = set()
+# json 文件分类: 配置文件才扫, 数据文件 (用户数据 / 缓存 / 状态) 不扫
+RX_CFG_VAR = re.compile(r"conf|config|setting|secret|credential|cfg", re.I)
+RX_DATA_VAR = re.compile(r"data|cache|state|backup|recent|history|log|db|store|record|servers?|users?|stats?|geo", re.I)
+json_cfg_vars = set()    # 赋值给 CONFIG_FILE 之类变量的 json
+json_data_vars = set()   # 赋值给 DATA_FILE 之类变量的 json
+cfg_get_keys = set()     # 代码里 X.get("key") 读取的键 (有兜底 = 可选)
+cfg_sub_keys = set()     # 代码里 X["key"] 直接读取的键 (没有兜底)
 
 for path in files_in(root, (".py",)):
     try:
@@ -1550,6 +1557,31 @@ for path in files_in(root, (".py",)):
         continue
     for m in re.findall(r"""["']([\w./-]+\.(?:json|ya?ml|toml|ini))["']""", src):
         json_refs.add(os.path.basename(m))
+    for n in ast.walk(tree):
+        tgt = None
+        if isinstance(n, ast.Assign) and len(n.targets) == 1:
+            tgt = n.targets[0]
+        elif isinstance(n, ast.AnnAssign):
+            tgt = n.target
+        if tgt is not None and n.value is not None:
+            tn = tgt.id if isinstance(tgt, ast.Name) else getattr(tgt, "attr", "")
+            for x in ast.walk(n.value):
+                if isinstance(x, ast.Constant) and isinstance(x.value, str) and x.value.endswith(".json"):
+                    b = os.path.basename(x.value)
+                    if RX_CFG_VAR.search(tn):
+                        json_cfg_vars.add(b)
+                    elif RX_DATA_VAR.search(tn):
+                        json_data_vars.add(b)
+        # 读取配置键的方式: X.get("k") 有兜底; X["k"] 没有兜底
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get" and n.args:
+            if isinstance(n.args[0], ast.Constant) and isinstance(n.args[0].value, str) \
+                    and getattr(n.func.value, "attr", "") != "environ" \
+                    and getattr(n.func.value, "id", "") != "environ":
+                cfg_get_keys.add(n.args[0].value.lower())
+        elif isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Load) \
+                and isinstance(n.slice, ast.Constant) and isinstance(n.slice.value, str) \
+                and getattr(n.value, "attr", "") != "environ" and getattr(n.value, "id", "") != "environ":
+            cfg_sub_keys.add(n.slice.value.lower())
 
     parent = {}
     for p in ast.walk(tree):
@@ -1693,6 +1725,16 @@ for path in files_in(root, (".py",)):
         add_env(name, has_def, dflt, hint, path)
         if name not in env:
             continue
+        # os.environ.get("X") or CONFIG.get("x"): 同一项配置的 json 写法, 记下来合并成一项
+        if isinstance(p, ast.BoolOp) and isinstance(p.op, ast.Or) and c in p.values:
+            for v in p.values:
+                if v is c:
+                    continue
+                for x in ast.walk(v):
+                    if isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr == "get" \
+                            and x.args and isinstance(x.args[0], ast.Constant) and isinstance(x.args[0].value, str) \
+                            and not is_environ(x.func.value):
+                        env[name].setdefault("cfgkeys", set()).add(x.args[0].value.lower())
         if alt:
             env[name].setdefault("alt", alt)
         else:
@@ -1898,26 +1940,32 @@ def clean(s):
 
 
 out = []
-for nm in sorted(env):
-    e = env[nm]
-    k = kind_of(nm, e["hint"])
-    req = e["forced"] or e["nodef"]
-    if e.get("alt") and not e.get("primary") and e["alt"] in env:
-        grp = "adv"
-        if not e["desc"]:
-            e["desc"] = "%s 的备用名称（填了 %s 就不用填）" % (e["alt"], e["alt"])
-    elif k == "port":
-        grp = "req"           # 端口总要分配, 避免和其他机器人撞车
-    elif req:
-        grp = "req"
-    elif RX_ADV.search(nm) and k not in ("token", "secret", "ids"):
-        grp = "adv"
-    else:
-        grp = "opt"
-    st = "set" if cur.get(nm, "") != "" else "unset"
-    if grp == "req" and k in ("token", "ids"):
-        e["default"] = ""      # Token / 管理员 ID 不能靠默认值
-    out.append(["env", nm, grp, k, clean(e["default"]), clean(e["desc"]), ",".join(sorted(e["files"]))[:80], st])
+env_json_set = set()   # 环境变量没填, 但对应的 json 键已经有值 (代码会读 json)
+
+
+def env_rows():
+    rows = []
+    for nm in sorted(env):
+        e = env[nm]
+        k = kind_of(nm, e["hint"])
+        req = e["forced"] or e["nodef"]
+        if e.get("alt") and not e.get("primary") and e["alt"] in env:
+            grp = "adv"
+            if not e["desc"]:
+                e["desc"] = "%s 的备用名称（填了 %s 就不用填）" % (e["alt"], e["alt"])
+        elif k == "port":
+            grp = "req"           # 端口总要分配, 避免和其他机器人撞车
+        elif req:
+            grp = "req"
+        elif RX_ADV.search(nm) and k not in ("token", "secret", "ids"):
+            grp = "adv"
+        else:
+            grp = "opt"
+        st = "set" if cur.get(nm, "") != "" or nm in env_json_set else "unset"
+        if grp == "req" and k in ("token", "ids"):
+            e["default"] = ""      # Token / 管理员 ID 不能靠默认值
+        rows.append(["env", nm, grp, k, clean(e["default"]), clean(e["desc"]), ",".join(sorted(e["files"]))[:80], st])
+    return rows
 
 # 代码常量: 已经用环境变量的项目只列出占位符 (还没填) 的
 env_names_upper = {n.upper() for n in env}
@@ -1955,10 +2003,29 @@ for f in sorted(os.listdir(root)):
         tgt = f.rsplit(".", 1)[0]
         out.append(["cfgother", tgt, "req", "file", "", "", f, "set" if os.path.exists(os.path.join(root, tgt)) else "unset"])
 
+
+
+def is_cfg_json(f):  # 只扫配置文件; 用户数据 / 缓存 / 状态文件不扫
+    if f in ("package.json", "package-lock.json", "tsconfig.json"):
+        return False
+    if f in json_cfg_vars:
+        return True
+    if f in json_data_vars:
+        return False
+    return bool(RX_CFG_VAR.search(f))
+
+
 json_files = set(r[1] for r in out if r[0] == "cfgex")
 for f in sorted(os.listdir(root)):
-    if f.endswith(".json") and f in json_refs and f not in ("package.json", "package-lock.json", "tsconfig.json"):
+    if f.endswith(".json") and f in json_refs and is_cfg_json(f):
         json_files.add(f)
+
+# 环境变量和 json 键是同一项配置时 (os.environ.get("X") or CONFIG.get("x")), 只保留环境变量那一项
+linked = {}
+for nm, e in env.items():
+    linked.setdefault(nm.lower(), nm)
+    for ck in e.get("cfgkeys", ()):
+        linked.setdefault(ck, nm)
 
 
 def walk_json(o, pfx):
@@ -1988,6 +2055,11 @@ for f in sorted(json_files):
         if not path:
             continue
         leaf = path[-1]
+        lk = leaf.lower()
+        if len(path) == 1 and lk in linked:
+            if not is_placeholder(v):
+                env_json_set.add(linked[lk])
+            continue
         if not RX_PY_CAND.search(leaf) and not is_placeholder(v):
             continue
         if isinstance(v, (dict, bool)) or (isinstance(v, list) and v and not all(isinstance(x, (int, str)) for x in v)):
@@ -1996,11 +2068,13 @@ for f in sorted(json_files):
         ph = is_placeholder(v)
         if not ph and k in ("str", "url", "num", "port"):
             continue
-        grp = "req" if ph and (k in ("token", "ids", "secret") or v in ("", None)) else "opt"
+        # 必填以代码为准: Token / 管理员 ID, 或代码里直接 X["key"] 读取 (没有兜底) 的才算必填
+        strict = lk in cfg_sub_keys and lk not in cfg_get_keys
+        grp = "req" if ph and (k == "token" or (k == "ids" and RX_ADMIN.search(leaf)) or strict) else "opt"
         shown = " ".join(str(x) for x in v) if isinstance(v, list) else ("" if v is None else str(v))
         out.append(["json", ".".join(path), grp, k, clean("" if ph else shown), "", f, "unset" if ph else "set"])
 
-for r in out:
+for r in env_rows() + out:
     print("\x1f".join(r))
 PY
 )
