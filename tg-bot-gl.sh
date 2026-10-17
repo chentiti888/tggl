@@ -40,7 +40,6 @@ dw() {
     echo $(( (b + c) / 2 ))
 }
 
-# 左对齐并补空格到指定显示宽度
 padr() {
     local s="$1" w="$2" n
     n=$(dw "$s")
@@ -62,7 +61,6 @@ cls() {
     return 0
 }
 
-# banner "左侧标题" ["右侧文字"]
 banner() {
     local left="$1" right="${2:-}" gap
     gap=$(( BOX_W - $(dw "$left") - $(dw "$right") - 4 ))
@@ -84,7 +82,6 @@ lab() {
     printf '%s' "${DIM}$(padr "$1" 8)${RESET}"
 }
 
-# menu_item 键 标题 说明
 menu_item() {
     local key="$1" t="$2" c="$CYAN"
     if [[ $key == 0 ]]; then
@@ -109,7 +106,6 @@ rd() {
     printf -v "$__v" '%s' "$__ans"
 }
 
-# 隐藏输入
 rds() {
     local __v="$1" text="$2" __ans
     read -r -s -p "  ${CYAN}›${RESET} ${text}: " __ans
@@ -1300,10 +1296,10 @@ create_dir() {
     CREATED_DIR=""
     local dir def="${1:-/root/mybot}"
     heading "创建安装目录"
-    echo "  ${DIM}绝对路径；不能直接用 /root、/opt 等系统目录；直接回车使用默认值${RESET}"
+    echo "  ${DIM}绝对路径；不能直接用 /root、/opt 等系统目录；直接回车使用默认值，输入 0 返回${RESET}"
     while true; do
         rd dir "目录" "$def"
-        if [[ -z "$dir" ]]; then warn "已取消。"; return 1; fi
+        [[ -z "$dir" || "$dir" == 0 ]] && return 9
         if [[ "$dir" != /* ]]; then
             err "必须是绝对路径（以 / 开头）。"
             continue
@@ -1326,23 +1322,65 @@ create_dir() {
     log "目录已创建：$dir"
 }
 
-# 主菜单 1：创建安装目录
-menu_create_dir() {
-    cls
-    banner "创建安装目录" "机器人代码存放位置"
+dir_state() {  # 目录 -> 状态文字
+    local u
+    u="$(dir_user "$1")"
+    if [[ -n "$u" ]]; then echo "机器人：$u"
+    elif [[ ! -d "$1" ]]; then echo "已不存在"
+    elif dir_is_empty "$1"; then echo "空闲"
+    else echo "非空"; fi
+}
+
+# 删除安装目录: 只能删没有机器人在用的; 目录里有文件时要再确认一次
+delete_dir() {
+    local sel d n
     list_dirs
-    if (( ${#DIRS[@]} > 0 )); then
-        heading "已创建的目录"
-        local d u state
-        for d in "${DIRS[@]}"; do
-            u="$(dir_user "$d")"
-            if [[ -n "$u" ]]; then state="机器人：$u"
-            elif dir_is_empty "$d"; then state="空闲"
-            else state="非空"; fi
-            printf '  %s  %s\n' "$(padr "$d" 30)" "${DIM}${state}${RESET}"
-        done
+    (( ${#DIRS[@]} > 0 )) || { warn "还没有创建过目录。"; return 0; }
+    rd sel "删除第几个目录（0 返回）"
+    [[ -z "$sel" || "$sel" == 0 ]] && return 9
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#DIRS[@]} )); then err "无效选择：$sel"; return 1; fi
+    d="${DIRS[sel-1]}"
+    if [[ -n "$(dir_user "$d")" ]]; then
+        err "机器人「$(dir_user "$d")」在用这个目录，请先在「管理机器人」里卸载它。"; return 1
     fi
-    create_dir
+    if is_unsafe_dir "$d"; then err "不能删除系统目录 $d"; return 1; fi
+    if [[ -d "$d" ]] && ! dir_is_empty "$d"; then
+        n=$(find "$d" -mindepth 1 2>/dev/null | wc -l)
+        warn "$d 里还有 ${n} 个文件/目录，删除后无法恢复。"
+        confirm "连同里面的文件一起删除？" || { warn "已取消。"; return 1; }
+    else
+        confirm_y "删除目录 $d？" || { warn "已取消。"; return 1; }
+    fi
+    rm -rf -- "$d" || { err "删除失败：$d"; return 1; }
+    awk -v d="$d" '$0 != d' "$DIRS_FILE" > "$DIRS_FILE.tmp" && mv -f "$DIRS_FILE.tmp" "$DIRS_FILE"
+    log "已删除：$d"
+}
+
+menu_create_dir() {
+    local c i
+    while true; do
+        cls
+        banner "安装目录" "机器人代码存放位置"
+        list_dirs
+        heading "已创建的目录"
+        if (( ${#DIRS[@]} == 0 )); then
+            echo "  ${DIM}（还没有）${RESET}"
+        else
+            for i in "${!DIRS[@]}"; do menu_item $((i + 1)) "${DIRS[i]}" "$(dir_state "${DIRS[i]}")"; done
+        fi
+        echo
+        menu_item n "新建目录" "默认 /root/mybot"
+        (( ${#DIRS[@]} > 0 )) && menu_item d "删除目录" "只能删没有机器人在用的"
+        menu_item 0 "返回"
+        echo
+        rd c "请选择"
+        case "$c" in
+            n|N) create_dir; (( $? == 9 )) || pause ;;
+            d|D) delete_dir; (( $? == 9 )) || pause ;;
+            0|q|Q|'') return 9 ;;
+            *) warn "无效选择：$c"; sleep 1 ;;
+        esac
+    done
 }
 
 # 选择一个空闲目录，结果放到 PICKED_DIR；参数 1 = 默认目录（直接回车使用，不存在则创建）
@@ -1361,8 +1399,10 @@ pick_dir() {
         done
     fi
     menu_item n "输入其他路径"
+    menu_item 0 "返回"
     echo
     rd sel "选择" "默认"
+    [[ "$sel" == 0 ]] && return 9
     if [[ "$sel" == "默认" ]]; then
         PICKED_DIR="$(realpath -m -- "$def" 2>/dev/null || echo "${def%/}")"
         mkdir -p "$PICKED_DIR" || { err "创建失败：$PICKED_DIR"; return 1; }
@@ -1370,7 +1410,7 @@ pick_dir() {
         grep -qxF -- "$PICKED_DIR" "$DIRS_FILE" 2>/dev/null || echo "$PICKED_DIR" >>"$DIRS_FILE"
         log "使用目录：$PICKED_DIR"
     elif [[ "$sel" =~ ^[Nn]$ ]]; then
-        create_dir "$def" || return 1
+        create_dir "$def" || return $?
         PICKED_DIR="$CREATED_DIR"
     elif [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#DIRS[@]} )); then
         PICKED_DIR="${DIRS[sel-1]}"
@@ -2402,8 +2442,8 @@ add_bot() {
     heading "[1/3] 机器人名称"
     echo "  ${DIM}用作 systemd 服务名；仅限小写字母、数字、- 和 _，例如 navbot${RESET}"
     while true; do
-        rd name "名称（直接回车取消）"
-        if [[ -z "$name" ]]; then warn "已取消。"; return 1; fi
+        rd name "名称（0 返回）"
+        [[ -z "$name" || "$name" == 0 ]] && return 9
         if [[ ! "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then err "名称不合法（小写字母/数字开头，只含小写字母、数字、- 和 _）。"; continue; fi
         if [[ -f "$CONF_DIR/$name.conf" ]]; then err "已存在同名机器人：$name，请换一个。"; continue; fi
         if [[ -e "/etc/systemd/system/$name.service" || -e "/lib/systemd/system/$name.service" || -e "/usr/lib/systemd/system/$name.service" ]]; then
@@ -2413,13 +2453,13 @@ add_bot() {
     done
 
     heading "[2/3] 安装目录"
-    pick_dir "/root/$name" || return 1
+    pick_dir "/root/$name" || return $?
     local dir="$PICKED_DIR"
 
     heading "[3/3] 机器人仓库"
     while true; do
-        rd url "仓库地址（如 https://github.com/用户/仓库.git；回车取消）" "$NEW_URL"
-        if [[ -z "$url" ]]; then warn "已取消。"; return 1; fi
+        rd url "仓库地址（如 https://github.com/用户/仓库.git；0 返回）" "$NEW_URL"
+        [[ -z "$url" || "$url" == 0 ]] && return 9
         break
     done
     rd branch "分支（留空=默认分支）"
@@ -2750,15 +2790,15 @@ while true; do
     echo "  $(lab 目录)${#DIRS[@]} 个    $(lab 机器人)${#BOTS[@]} 个"
     [[ -x "$CMD_BIN" ]] && echo "  ${DIM}快捷命令：tgbot${RESET}"
     echo
-    menu_item 1 "创建安装目录" "默认 /root/mybot，回车即可"
+    menu_item 1 "安装目录" "新建 / 删除，默认 /root/mybot"
     menu_item 2 "添加机器人" "仓库拉取→装依赖→密钥→启动自启"
     menu_item 3 "管理机器人" "启动 / 停止 / 自启 / 日志 / 卸载"
     menu_item 0 "退出"
     echo
     rd CHOICE "请选择" "$([[ -n "$NEW_URL" ]] && echo 2)"
     case "$CHOICE" in
-        1) menu_create_dir; pause ;;
-        2) add_bot; pause ;;
+        1) menu_create_dir ;;
+        2) add_bot; (( $? == 9 )) || pause ;;
         3) if pick_bot; then bot_menu; else pause; fi ;;
         0|q|Q) [[ -n ${TGBOT_FROM_WSM:-} ]] || { echo; echo "  已退出。"; }; exit 0 ;;
         *) warn "无效选择：$CHOICE"; sleep 1 ;;
