@@ -14,12 +14,16 @@ esac
 
 # ---------------------------------------------------------------- 颜色与界面
 
-RED=$'\033[31m'
-GREEN=$'\033[32m'
-YELLOW=$'\033[33m'
-CYAN=$'\033[36m'
+# 配色和 wsm 一致 (256 色; 终端只支持 8 色时退回基本色)
+# 主色(天蓝): 序号/标题/提示   正文: 亮白   说明: 灰   状态: 绿=正常 黄=注意 红=异常/退出
+if [[ ${TERM:-} == *256color* || ${COLORTERM:-} == *color* || ${TERM:-} == xterm* || ${TERM:-} == screen* || ${TERM:-} == tmux* ]]; then
+    RED=$'\033[38;5;203m'; GREEN=$'\033[38;5;114m'; YELLOW=$'\033[38;5;221m'; CYAN=$'\033[38;5;75m'
+    DIM=$'\033[38;5;244m'; TXT=$'\033[38;5;252m'; LINE=$'\033[38;5;238m'
+else
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'
+    DIM=$'\033[2m'; TXT=$'\033[0m'; LINE=$'\033[2m'
+fi
 BOLD=$'\033[1m'
-DIM=$'\033[2m'
 RESET=$'\033[0m'
 
 BOX_W=54
@@ -63,15 +67,17 @@ banner() {
     local left="$1" right="${2:-}" gap
     gap=$(( BOX_W - $(dw "$left") - $(dw "$right") - 4 ))
     (( gap < 1 )) && gap=1
-    echo "${CYAN}╔$(rep "$BOX_W" ═)╗${RESET}"
-    echo "${CYAN}║${RESET}  ${BOLD}${left}${RESET}$(rep "$gap" ' ')${DIM}${right}${RESET}  ${CYAN}║${RESET}"
-    echo "${CYAN}╚$(rep "$BOX_W" ═)╝${RESET}"
+    echo
+    echo "  ${LINE}╭$(rep "$BOX_W" ─)╮${RESET}"
+    echo "  ${LINE}│${RESET}  ${BOLD}${CYAN}${left}${RESET}$(rep "$gap" ' ')${DIM}${right}${RESET}  ${LINE}│${RESET}"
+    echo "  ${LINE}╰$(rep "$BOX_W" ─)╯${RESET}"
 }
 
 heading() {
+    local n=$(( 46 - $(dw "$1") ))
+    (( n < 4 )) && n=4
     echo
-    echo "  ${BOLD}${CYAN}$1${RESET}"
-    echo "  ${DIM}$(rep 46 ─)${RESET}"
+    echo "  ${BOLD}${CYAN}$1${RESET} ${LINE}$(rep "$n" ─)${RESET}"
 }
 
 lab() {
@@ -80,17 +86,25 @@ lab() {
 
 # menu_item 键 标题 说明
 menu_item() {
-    printf '  %s) %s  %s\n' "${YELLOW}$1${RESET}" "$(padr "$2" 22)" "${DIM}${3:-}${RESET}"
+    local key="$1" t="$2" c="$CYAN"
+    if [[ $key == 0 ]]; then
+        # 从 wsm 菜单进来时, 主菜单的 "退出" 显示成 "返回 wsm"
+        [[ $t == 退出 && -n ${TGBOT_FROM_WSM:-} ]] && t="返回 wsm"
+        if [[ $t == 退出 ]]; then c="$RED"; else c="$GREEN"; fi
+        printf '  %s%3s%s  %s%s%s\n' "$BOLD$c" "$key" "$RESET" "$c" "$t" "$RESET"
+        return 0
+    fi
+    printf '  %s%3s%s  %s%s%s  %s\n' "$BOLD$CYAN" "$key" "$RESET" "$TXT" "$(padr "$t" 20)" "$RESET" "${DIM}${3:-}${RESET}"
 }
 
 # rd 变量名 "提示" [默认值]
 rd() {
     local __v="$1" text="$2" def="${3:-}" __ans
     if [[ -n "$def" ]]; then
-        read -r -p "  ${CYAN}▸${RESET} ${text} ${DIM}[${def}]${RESET}: " __ans
+        read -r -p "  ${CYAN}›${RESET} ${text} ${DIM}[${def}]${RESET}: " __ans
         __ans="${__ans:-$def}"
     else
-        read -r -p "  ${CYAN}▸${RESET} ${text}: " __ans
+        read -r -p "  ${CYAN}›${RESET} ${text}: " __ans
     fi
     printf -v "$__v" '%s' "$__ans"
 }
@@ -98,7 +112,7 @@ rd() {
 # 隐藏输入
 rds() {
     local __v="$1" text="$2" __ans
-    read -r -s -p "  ${CYAN}▸${RESET} ${text}: " __ans
+    read -r -s -p "  ${CYAN}›${RESET} ${text}: " __ans
     echo
     printf -v "$__v" '%s' "$__ans"
 }
@@ -107,13 +121,13 @@ ask() { rd "$@"; }
 
 confirm() {
     local a
-    read -r -p "  ${CYAN}▸${RESET} $1 ${DIM}[y/N]${RESET}: " a
+    read -r -p "  ${CYAN}›${RESET} $1 ${DIM}[y/N]${RESET}: " a
     [[ "$a" =~ ^[Yy]$ ]]
 }
 
 confirm_y() {
     local a
-    read -r -p "  ${CYAN}▸${RESET} $1 ${DIM}[Y/n]${RESET}: " a
+    read -r -p "  ${CYAN}›${RESET} $1 ${DIM}[Y/n]${RESET}: " a
     [[ -z "$a" || "$a" =~ ^[Yy]$ ]]
 }
 
@@ -1090,7 +1104,7 @@ cfg_custom() {
         for i in "${!SECRET_VARS[@]}"; do
             n="${SECRET_VARS[i]}"
             if env_is_set "$n"; then st="${GREEN}已设置${RESET}"; else st="${YELLOW}未设置${RESET}"; fi
-            printf '  %s) %s %s\n' "${YELLOW}$((i + 1))${RESET}" "$(padr "$n" 20)" "$st"
+            printf '  %s%3s%s  %s %s\n' "$BOLD$CYAN" "$((i + 1))" "$RESET" "${TXT}$(padr "$n" 20)${RESET}" "$st"
             echo "       ${DIM}$(var_desc "$n")${RESET}"
         done
         echo
@@ -2321,7 +2335,7 @@ var_edit_menu() {
                 if [[ "${VS_ST[i]}" == set ]]; then st="${GREEN}已设置${RESET}"
                 elif [[ -n "${VS_DEF[i]}" ]]; then st="${DIM}默认值${RESET}"
                 else st="${YELLOW}未设置${RESET}"; fi
-                printf '  %s) %s %s  %s\n' "${YELLOW}$(padr "${#idx[@]}" 2)${RESET}" "$(padr "${VS_NAME[i]}" 22)" "$st" "${DIM}$(var_info "$i")${RESET}"
+                printf '  %s%3s%s  %s %s  %s\n' "$BOLD$CYAN" "${#idx[@]}" "$RESET" "${TXT}$(padr "${VS_NAME[i]}" 22)${RESET}" "$st" "${DIM}$(var_info "$i")${RESET}"
             done
             (( first )) || echo
         done
@@ -2463,7 +2477,7 @@ pick_bot() {
     for i in "${!BOTS[@]}"; do
         info="$( source "$CONF_DIR/${BOTS[i]}.conf" 2>/dev/null
                  printf '%s  %s' "$(svc_state "${SERVICE_NAME:-${BOTS[i]}}")" "${DIM}${INSTALL_DIR}${RESET}" )"
-        printf '  %s) %s  %s\n' "${YELLOW}$((i + 1))${RESET}" "$(padr "${BOTS[i]}" 16)" "$info"
+        printf '  %s%3s%s  %s  %s\n' "$BOLD$CYAN" "$((i + 1))" "$RESET" "${TXT}$(padr "${BOTS[i]}" 16)${RESET}" "$info"
     done
     echo
     local def=""
@@ -2746,7 +2760,7 @@ while true; do
         1) menu_create_dir; pause ;;
         2) add_bot; pause ;;
         3) if pick_bot; then bot_menu; else pause; fi ;;
-        0|q|Q) echo; echo "  已退出。"; exit 0 ;;
+        0|q|Q) [[ -n ${TGBOT_FROM_WSM:-} ]] || { echo; echo "  已退出。"; }; exit 0 ;;
         *) warn "无效选择：$CHOICE"; sleep 1 ;;
     esac
 done
