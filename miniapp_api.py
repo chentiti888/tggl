@@ -1603,28 +1603,32 @@ GROUP_LIMIT = 30           # 每个人最多建多少个分组
 OFFLINE_AFTER = 30          # 超过这么多秒没收到数据就算离线
 SERVERS = []                # [{"id","name","token","created","owner","group"}]
 GROUPS = {}                 # 每个人的服务器分组（按顺序）：{"<uid>": ["香港", "日本", ...]}
+GROUP_DEF = {}              # 每个人「默认组」的名字（没归类的服务器都在这组，可以改名，不能删）：{"<uid>": "其他"}
+GROUP_DEF_NAME = "未分组"
 LIVE = {}                   # id -> {"ts", "ip", "m": {...}}
 
 
 def load_servers():
-    global SERVERS, GROUPS
+    global SERVERS, GROUPS, GROUP_DEF
     try:
         with open(SERVERS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         SERVERS = [x for x in data.get("servers", []) if x.get("id") and x.get("token")]
         g = data.get("groups")
         GROUPS = {str(k): [str(n) for n in v if n] for k, v in g.items() if isinstance(v, list)} if isinstance(g, dict) else {}
+        gd = data.get("group_default")
+        GROUP_DEF = {str(k): str(v) for k, v in gd.items() if v} if isinstance(gd, dict) else {}
     except FileNotFoundError:
-        SERVERS, GROUPS = [], {}
+        SERVERS, GROUPS, GROUP_DEF = [], {}, {}
     except Exception as e:
         print("多服务器列表读取失败：", e)
-        SERVERS, GROUPS = [], {}
+        SERVERS, GROUPS, GROUP_DEF = [], {}, {}
 
 
 def save_servers():
     tmp = SERVERS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"servers": SERVERS, "groups": GROUPS}, f, ensure_ascii=False, indent=1)
+        json.dump({"servers": SERVERS, "groups": GROUPS, "group_default": GROUP_DEF}, f, ensure_ascii=False, indent=1)
     os.chmod(tmp, 0o600)
     os.replace(tmp, SERVERS_FILE)
 
@@ -1756,6 +1760,10 @@ def _groups_of(uid):
     return gl
 
 
+def _group_def(uid):
+    return GROUP_DEF.get(str(uid)) or GROUP_DEF_NAME
+
+
 def _group_name(v):
     name = clean(v, 20).strip()
     if not name:
@@ -1766,7 +1774,8 @@ def _group_name(v):
 @action("servers", admin=True)
 async def a_servers(ctx, p):
     items = [server_view(s) for s in my_servers(ctx["uid"])]
-    return {"items": items, "groups": _groups_of(ctx["uid"]), "limit": SERVER_LIMIT, **servers_summary(ctx["uid"])}
+    return {"items": items, "groups": _groups_of(ctx["uid"]), "default_group": _group_def(ctx["uid"]),
+            "limit": SERVER_LIMIT, **servers_summary(ctx["uid"])}
 
 
 @action("server_get", admin=True)
@@ -1781,7 +1790,7 @@ async def a_server_edit(ctx, p):
     # ---- 分组：新建 / 改名 / 删除 / 调整顺序（不针对某一台服务器）
     if op == "group_add":
         name, gl = _group_name(p.get("name")), _groups_of(uid)
-        if name in gl:
+        if name in gl or name == _group_def(uid):
             raise ApiError("已经有这个分组了")
         if len(gl) >= GROUP_LIMIT:
             raise ApiError(f"最多 {GROUP_LIMIT} 个分组")
@@ -1792,7 +1801,7 @@ async def a_server_edit(ctx, p):
         old, new, gl = str(p.get("old") or ""), _group_name(p.get("name")), _groups_of(uid)
         if old not in gl:
             raise ApiError("这个分组不存在")
-        if new != old and new in gl:
+        if new != old and (new in gl or new == _group_def(uid)):
             raise ApiError("已经有这个分组了")
         GROUPS[key] = [new if g == old else g for g in gl]
         for s in my_servers(uid):
@@ -1800,6 +1809,13 @@ async def a_server_edit(ctx, p):
                 s["group"] = new
         save_servers()
         return {"groups": GROUPS[key]}
+    if op == "group_default":                           # 默认组（没归类的服务器）改名
+        new = _group_name(p.get("name"))
+        if new in _groups_of(uid):
+            raise ApiError("已经有这个分组了")
+        GROUP_DEF[key] = new
+        save_servers()
+        return {"default_group": new}
     if op == "group_del":
         old, gl = str(p.get("name") or ""), _groups_of(uid)
         GROUPS[key] = [g for g in gl if g != old]
