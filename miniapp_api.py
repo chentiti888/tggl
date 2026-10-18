@@ -1935,18 +1935,22 @@ async def _dns_park(srv, ip, minutes):
                            "content": r["content"], "ttl": r["ttl"], "proxied": r["proxied"], "comment": r["comment"]})
     if parked:
         srv["dns_parked"] = (srv.get("dns_parked") or []) + parked
-        save_servers()
+    if not srv.get("dns_down"):
+        srv["dns_down"] = int(time.time() - minutes * 60)   # 记住离线开始时间，恢复时要通知
+    save_servers()
     st = DNS_STATE.setdefault(srv["id"], {})
-    if not parked and set(kept) == st.get("kept_told", set()):
+    if not parked and st.get("kept_told") == set(kept):
         return                              # 没有新变化：不重复提醒
     st["kept_told"] = set(kept)
-    if not parked and not kept:
-        return
     msg = f"⚠️ 服务器「{srv['name']}」（{ip}）离线超过 {minutes} 分钟"
+    if not parked and not kept:
+        msg += "\nCloudflare 上没有指向它的 A 记录，不需要切换。恢复后会再通知你。"
     if parked:
         msg += f"\n已临时摘除 {len(parked)} 条解析，流量切到同名的其他服务器：{_names(parked)}\n恢复在线后会自动加回。"
     if kept:
         msg += f"\n以下记录没有其他可用服务器，保留未动：{_names(kept, 6)}"
+    if kept and not parked:
+        msg += "\n恢复后会再通知你。"
     await _dns_notify(msg)
 
 
@@ -1996,12 +2000,20 @@ async def _dns_failover_check(srv):
     if online:
         st.pop("park_tried", None)
         st.pop("kept_told", None)
-        if srv.get("dns_parked"):
+        if srv.get("dns_parked") or srv.get("dns_down"):
             st.setdefault("up_since", now)
             if now - st["up_since"] >= DNS_UP_STABLE and now - st.get("unpark_try", 0) >= DNS_RETRY_EVERY:
                 st["unpark_try"] = now
-                _ok, left = await _dns_unpark(srv, "已恢复在线")
+                down = srv.get("dns_down")
+                dur = f"（离线约 {max(1, int((st['up_since'] - down) // 60))} 分钟）" if down else ""
+                if srv.get("dns_parked"):
+                    _ok, left = await _dns_unpark(srv, "已恢复在线" + dur)
+                else:
+                    left = []
+                    await _dns_notify(f"✅ 服务器「{srv['name']}」已恢复在线{dur}")
                 if not left:
+                    srv.pop("dns_down", None)
+                    save_servers()
                     st.pop("up_since", None)
                     st.pop("unpark_try", None)
         return
@@ -2072,6 +2084,8 @@ async def _dns_set(ctx, srv, p):
         if left:
             raise ApiError(f"有 {len(left)} 条摘除的解析没能加回，请稍后再试")
     srv["dns_auto"], srv["dns_failover"] = auto, fo
+    if not fo:
+        srv.pop("dns_down", None)
     if not auto and not fo:
         srv.pop("dns_ip", None)          # 都关了：下次开启时重新记住当时的 IP
         DNS_STATE.pop(srv["id"], None)
