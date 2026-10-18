@@ -21,9 +21,11 @@ PHP 页面（api.php）把 Mini App 的请求转发到这里。
 import asyncio
 from collections import deque
 import base64
+import calendar
 import hashlib
 import hmac
 import html as _html
+import ipaddress
 import json
 import os
 import re
@@ -31,6 +33,7 @@ import secrets
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -177,7 +180,7 @@ def target_host(text):
 
 
 ACTIONS = {}
-OWNER_ONLY = {"users", "users_edit"}      # 授权用户管理：只有所有者能用
+OWNER_ONLY = {"users", "users_edit", "cf", "cf_edit"}      # 授权用户管理 / Cloudflare 解析：只有所有者能用
 
 
 def action(name, admin=False):
@@ -478,6 +481,518 @@ async def a_notes_edit(ctx, p):
             raise ApiError("未知操作")
     dh.save_data(dh.data)
     return _notes_out(uid)
+
+
+# ---------------------------------------------------------------- Cloudflare 域名解析
+# Token 只放在服务器上：环境变量 CF_API_TOKEN，或 nav_miniapp.json 里的 "cf_token"。
+# 建议在 Cloudflare 建一个只有「区域:读取 + DNS:编辑」权限、并限定到你自己域名的 Token。
+# 只有所有者能用（OWNER_ONLY）；每次增 / 改 / 删都会追加一行到 cf_audit.jsonl。
+
+CF_API = "https://api.cloudflare.com/client/v4"
+CF_PROXIABLE = ("A", "AAAA", "CNAME")
+CF_EDIT_TYPES = ("A", "AAAA", "CNAME", "TXT", "MX", "NS")   # 其它类型(SRV/CAA 等)只能查看和删除
+CF_AUDIT_FILE = _data_path("cf_audit.jsonl")
+CF_ZONES = {"ts": 0, "items": []}
+CF_HEX32 = re.compile(r"^[0-9a-f]{32}$")
+CF_NAME_RE = re.compile(r"^(\*\.)?[a-z0-9_]([a-z0-9_\-.]*[a-z0-9_])?$")
+CF_HOST_RE = re.compile(r"^[a-z0-9_]([a-z0-9_\-.]*[a-z0-9_])?$")
+
+
+def _cf_token():
+    tok = (os.environ.get("CF_API_TOKEN") or CONF.get("cf_token") or "").strip()
+    if not tok:
+        raise ApiError("还没有配置 Cloudflare Token：在服务器环境变量设置 CF_API_TOKEN，"
+                       "或在 nav_miniapp.json 里加 \"cf_token\"，然后重启机器人", 400)
+    return tok
+
+
+CF_NEED_DNS = "（需要「区域:读取」和「DNS:编辑」）"
+CF_NEED_PURGE = "（清除缓存需要给 Token 加「区域 → 缓存清除 → 清除」权限）"
+
+
+def _cf_call_sync(method, path, body=None, query=None, need=CF_NEED_DNS):
+    url = CF_API + path + ("?" + urllib.parse.urlencode(query) if query else "")
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": "Bearer " + _cf_token(),
+        "Content-Type": "application/json",
+        "User-Agent": "nav-miniapp/1.0",
+    })
+    status = 200
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    except Exception as e:
+        raise ApiError("连接不上 Cloudflare：" + str(getattr(e, "reason", e))[:80], 502)
+    try:
+        j = json.loads(raw.decode() or "{}")
+    except Exception:
+        raise ApiError("Cloudflare 返回的内容无法识别", 502)
+    if status in (401, 403):
+        raise ApiError("Cloudflare Token 无效或权限不够" + (need or ""), 400)
+    if not j.get("success"):
+        msgs = [str(e.get("message") or "") for e in (j.get("errors") or []) if isinstance(e, dict)]
+        raise ApiError("Cloudflare：" + ("；".join(m for m in msgs if m) or f"请求失败 ({status})")[:200])
+    return j
+
+
+async def _cf_call(method, path, body=None, query=None, need=CF_NEED_DNS):
+    return await asyncio.to_thread(_cf_call_sync, method, path, body, query, need)
+
+
+async def _cf_zones(force=False):
+    if not force and CF_ZONES["items"] and time.time() - CF_ZONES["ts"] < 60:
+        return CF_ZONES["items"]
+    items, page = [], 1
+    while page <= 5:
+        j = await _cf_call("GET", "/zones", query={"per_page": 50, "page": page})
+        items += [{"id": z["id"], "name": z["name"], "status": z.get("status", ""), "paused": bool(z.get("paused"))}
+                  for z in j.get("result") or []]
+        if page >= int((j.get("result_info") or {}).get("total_pages", 1)):
+            break
+        page += 1
+    items.sort(key=lambda z: z["name"])
+    CF_ZONES.update(ts=time.time(), items=items)
+    return items
+
+
+async def _cf_zone(p):
+    zid = str(p.get("zone") or "")
+    if not CF_HEX32.match(zid):
+        raise ApiError("域名参数不正确")
+    for force in (False, True):
+        for z in await _cf_zones(force):
+            if z["id"] == zid:
+                return z
+    raise ApiError("这个域名不在当前 Token 的权限范围内", 404)
+
+
+def _cf_ts(s):
+    try:
+        return calendar.timegm(time.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 0
+
+
+def _cf_view(r):
+    typ = r.get("type", "")
+    return {"id": r.get("id"), "type": typ, "name": r.get("name", ""), "content": r.get("content", ""),
+            "ttl": r.get("ttl", 1), "proxied": bool(r.get("proxied")), "proxiable": typ in CF_PROXIABLE,
+            "priority": r.get("priority"), "comment": r.get("comment") or "",
+            "modified": _cf_ts(r.get("modified_on")), "editable": typ in CF_EDIT_TYPES}
+
+
+async def _cf_get_record(zone, p):
+    rid = str(p.get("id") or "")
+    if not CF_HEX32.match(rid):
+        raise ApiError("记录参数不正确")
+    try:
+        j = await _cf_call("GET", f"/zones/{zone['id']}/dns_records/{rid}")
+    except ApiError:
+        raise ApiError("这条记录已经不存在了，请刷新")
+    return j["result"]
+
+
+def _cf_host(text, what):
+    h = str(text or "").strip().lower().rstrip(".")
+    if not h or len(h) > 253 or not CF_HOST_RE.match(h):
+        raise ApiError(f"{what}格式不正确")
+    return h
+
+
+def _cf_fields(zone, p, typ):
+    """校验并整理要写给 Cloudflare 的字段。"""
+    zn = zone["name"]
+    raw = str(p.get("name") or "").strip().lower().rstrip(".")
+    if raw in ("", "@"):
+        name = zn
+    elif raw == zn or raw.endswith("." + zn):
+        name = raw
+    else:
+        name = raw + "." + zn
+    if len(name) > 253 or not CF_NAME_RE.match(name):
+        raise ApiError("名称格式不正确（只支持英文、数字、-、_，泛解析写 *）")
+    content = str(p.get("content") or "").strip()
+    if not content:
+        raise ApiError("内容不能为空")
+    out = {"type": typ, "name": name}
+    if typ == "A":
+        try:
+            content = str(ipaddress.IPv4Address(content))
+        except ValueError:
+            raise ApiError("A 记录的内容必须是 IPv4 地址")
+    elif typ == "AAAA":
+        try:
+            content = str(ipaddress.IPv6Address(content))
+        except ValueError:
+            raise ApiError("AAAA 记录的内容必须是 IPv6 地址")
+    elif typ in ("CNAME", "NS", "MX"):
+        content = _cf_host(content, "目标地址")
+    elif typ == "TXT":
+        if len(content) > 2048:
+            raise ApiError("TXT 内容太长了，最多 2048 个字符")
+    out["content"] = content
+    if typ == "MX":
+        try:
+            prio = int(p.get("priority"))
+            if not 0 <= prio <= 65535:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ApiError("MX 记录的优先级要填 0 到 65535 的整数")
+        out["priority"] = prio
+    try:
+        ttl = int(p.get("ttl") or 1)
+    except (TypeError, ValueError):
+        raise ApiError("TTL 不正确")
+    if ttl != 1 and not 60 <= ttl <= 86400:
+        raise ApiError("TTL 只能是「自动」或 60 到 86400 秒")
+    proxied = bool(p.get("proxied")) and typ in CF_PROXIABLE
+    out["proxied"] = proxied
+    out["ttl"] = 1 if proxied else ttl
+    comment = str(p.get("comment") or "").strip()
+    if len(comment) > 100:
+        raise ApiError("备注太长了，最多 100 个字")
+    out["comment"] = comment
+    return out
+
+
+def _cf_audit(ctx, op, zone, before, after):
+    try:
+        row = {"t": int(time.time()), "uid": ctx["uid"], "op": op, "zone": zone["name"],
+               "before": before, "after": after}
+        with open(CF_AUDIT_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        os.chmod(CF_AUDIT_FILE, 0o600)
+    except Exception as e:
+        print("Cloudflare 操作日志写入失败：", e)
+
+
+async def _cf_records(zone):
+    recs, page = [], 1
+    while page <= 5:
+        j = await _cf_call("GET", f"/zones/{zone['id']}/dns_records", query={"per_page": 1000, "page": page})
+        recs += [_cf_view(r) for r in j.get("result") or []]
+        if page >= int((j.get("result_info") or {}).get("total_pages", 1)):
+            break
+        page += 1
+    recs.sort(key=lambda r: (r["name"], r["type"]))
+    return recs
+
+
+@action("cf", admin=True)
+async def a_cf(ctx, p):
+    if not p.get("zone"):
+        zones, pending = _exp_attach(await _cf_zones(force=bool(p.get("refresh"))), force=bool(p.get("refresh")))
+        return {"zones": zones, "exp_pending": pending}
+    zone = await _cf_zone(p)
+    return {"zone": zone, "records": await _cf_records(zone)}
+
+
+@action("cf_edit", admin=True)
+async def a_cf_edit(ctx, p):
+    need_rate(ctx["uid"], 1)
+    op = p.get("op")
+    zone = await _cf_zone(p)
+    base = f"/zones/{zone['id']}/dns_records"
+    if op == "purge":
+        return await _cf_purge(ctx, zone, p)
+    if op == "add":
+        typ = str(p.get("type") or "").upper()
+        if typ not in CF_EDIT_TYPES:
+            raise ApiError("不支持的记录类型")
+        j = await _cf_call("POST", base, _cf_fields(zone, p, typ))
+        rec = _cf_view(j["result"])
+        _cf_audit(ctx, "add", zone, None, rec)
+        return {"record": rec}
+    old = await _cf_get_record(zone, p)
+    before = _cf_view(old)
+    if op == "edit":
+        if old.get("type") not in CF_EDIT_TYPES:
+            raise ApiError("这种类型的记录暂不支持在这里修改，请到 Cloudflare 后台操作")
+        typ = str(p.get("type") or old["type"]).upper()
+        if typ not in CF_EDIT_TYPES:
+            raise ApiError("不支持的记录类型")
+        j = await _cf_call("PATCH", f"{base}/{old['id']}", _cf_fields(zone, p, typ))
+        rec = _cf_view(j["result"])
+        _cf_audit(ctx, "edit", zone, before, rec)
+        return {"record": rec}
+    if op == "proxy":
+        if old.get("type") not in CF_PROXIABLE:
+            raise ApiError("这种类型的记录不能开启 Cloudflare 代理")
+        on = bool(p.get("proxied"))
+        body = {"proxied": on}
+        if on:
+            body["ttl"] = 1
+        j = await _cf_call("PATCH", f"{base}/{old['id']}", body)
+        rec = _cf_view(j["result"])
+        _cf_audit(ctx, "proxy", zone, before, rec)
+        return {"record": rec}
+    if op == "del":
+        await _cf_call("DELETE", f"{base}/{old['id']}")
+        _cf_audit(ctx, "del", zone, before, None)
+        return {"deleted": before}
+    raise ApiError("未知操作")
+
+
+# ---- 域名到期日：用公开的 RDAP 查询（不管在哪家注册都能查），查不到再用 WHOIS
+# 结果缓存到 cf_expiry.json，12 小时刷新一次；查询在后台进行，不拖慢页面。
+CF_EXP_FILE = _data_path("cf_expiry.json")
+CF_EXP_TTL = 12 * 3600
+CF_EXP_FAIL_TTL = 3600
+CF_EXP_BUSY = set()
+CF_RDAP_BOOT = {"t": 0, "map": {}}
+try:
+    with open(CF_EXP_FILE, "r", encoding="utf-8") as _f:
+        CF_EXP = json.load(_f)
+    if not isinstance(CF_EXP, dict):
+        CF_EXP = {}
+except Exception:
+    CF_EXP = {}
+
+_EXP_RE = re.compile(r"(?im)^\s*(?:registry expiry date|registrar registration expiration date|expiration date|"
+                     r"expiry date|expiration time|expire date|expires on|expires|paid-till|renewal date)\s*:\s*(.+?)\s*$")
+
+
+def _exp_parse(s):
+    s = str(s or "").strip()
+    for fmt, n in (("%Y-%m-%d", 10), ("%Y.%m.%d", 10), ("%Y/%m/%d", 10), ("%d-%b-%Y", 11), ("%d.%m.%Y", 10)):
+        try:
+            return calendar.timegm(time.strptime(s[:n], fmt))
+        except ValueError:
+            continue
+    return 0
+
+
+def _http_json(url, timeout=10):
+    req = urllib.request.Request(url, headers={"Accept": "application/rdap+json, application/json",
+                                               "User-Agent": "nav-miniapp/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _rdap_base(tld):
+    if time.time() - CF_RDAP_BOOT["t"] > 86400 or not CF_RDAP_BOOT["map"]:
+        try:
+            m = {}
+            for svc in _http_json("https://data.iana.org/rdap/dns.json").get("services", []):
+                for t in svc[0]:
+                    if svc[1]:
+                        m[t.lower()] = svc[1][0]
+            CF_RDAP_BOOT.update(t=time.time(), map=m)
+        except Exception as e:
+            print("RDAP 列表下载失败：", e)
+            CF_RDAP_BOOT["t"] = time.time() - 86400 + 600     # 10 分钟后再试
+    return CF_RDAP_BOOT["map"].get(tld)
+
+
+def _rdap_expiry(name):
+    tld = name.rsplit(".", 1)[-1].lower()
+    base = _rdap_base(tld)
+    url = (base.rstrip("/") + "/domain/" + name) if base else ("https://rdap.org/domain/" + name)
+    j = _http_json(url)
+    for e in j.get("events") or []:
+        if str(e.get("eventAction", "")).lower() in ("expiration", "registration expiration"):
+            ts = _exp_parse(e.get("eventDate"))
+            if ts:
+                return ts
+    return 0
+
+
+def _whois_query(server, q):
+    import socket
+    with socket.create_connection((server, 43), timeout=10) as s:
+        s.sendall((q + "\r\n").encode())
+        buf = b""
+        while len(buf) < 200000:
+            chunk = s.recv(8192)
+            if not chunk:
+                break
+            buf += chunk
+    return buf.decode("utf-8", "replace")
+
+
+def _whois_expiry(name):
+    tld = name.rsplit(".", 1)[-1].lower()
+    m = re.search(r"(?im)^\s*(?:whois|refer):\s*(\S+)", _whois_query("whois.iana.org", tld))
+    if not m:
+        return 0
+    text = _whois_query(m.group(1), name)
+    m2 = _EXP_RE.search(text)
+    return _exp_parse(m2.group(1)) if m2 else 0
+
+
+def _exp_lookup(name):
+    err = ""
+    try:
+        ts = _rdap_expiry(name)
+        if ts:
+            return ts, ""
+    except Exception as e:
+        err = str(e)[:80]
+    try:
+        ts = _whois_expiry(name)
+        if ts:
+            return ts, ""
+    except Exception as e:
+        err = err or str(e)[:80]
+    print(f"域名到期日查询失败：{name} {err}")
+    return 0, "查不到到期日"
+
+
+async def _exp_refresh(names):
+    changed = False
+    for n in names:
+        if n in CF_EXP_BUSY:
+            continue
+        CF_EXP_BUSY.add(n)
+        try:
+            ts, err = await asyncio.to_thread(_exp_lookup, n)
+            CF_EXP[n] = {"exp": ts, "t": int(time.time()), "err": err}
+            changed = True
+        finally:
+            CF_EXP_BUSY.discard(n)
+    if changed:
+        try:
+            tmp = CF_EXP_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(CF_EXP, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, CF_EXP_FILE)
+        except Exception as e:
+            print("到期日缓存保存失败：", e)
+
+
+def _exp_attach(zones, force=False):
+    """给域名列表加上到期日；过期的缓存在后台刷新。返回是否还有没查完的。"""
+    stale, now = [], time.time()
+    out = []
+    for z in zones:
+        c = CF_EXP.get(z["name"]) or {}
+        ttl = CF_EXP_TTL if c.get("exp") else CF_EXP_FAIL_TTL
+        if force or not c or now - c.get("t", 0) > ttl:
+            stale.append(z["name"])
+        out.append(dict(z, exp=c.get("exp") or 0, exp_err=c.get("err") or ""))
+    if stale:
+        asyncio.get_running_loop().create_task(_exp_refresh(stale))
+    pending = any(not (CF_EXP.get(n) or {}) for n in stale) or (force and bool(stale))
+    return out, pending
+
+
+# ---- 清除缓存
+CF_PURGE_MAX = 30
+
+
+async def _cf_purge(ctx, zone, p):
+    path = f"/zones/{zone['id']}/purge_cache"
+    if p.get("mode") == "all":
+        await _cf_call("POST", path, {"purge_everything": True}, need=CF_NEED_PURGE)
+        _cf_audit(ctx, "purge", zone, None, {"all": True})
+        return {"purged": "all"}
+    urls = []
+    for line in re.split(r"[\s,]+", str(p.get("urls") or "")):
+        line = line.strip()
+        if not line:
+            continue
+        if not re.match(r"^https?://", line, re.I):
+            line = "https://" + line
+        try:
+            host = (urllib.parse.urlsplit(line).hostname or "").lower()
+        except ValueError:
+            host = ""
+        if not host or not (host == zone["name"] or host.endswith("." + zone["name"])):
+            raise ApiError(f"这个网址不属于 {zone['name']}：{line[:80]}")
+        if len(line) > 1000:
+            raise ApiError("网址太长了")
+        if line not in urls:
+            urls.append(line)
+    if not urls:
+        raise ApiError("请填写要清除的网址，一行一个")
+    if len(urls) > CF_PURGE_MAX:
+        raise ApiError(f"一次最多清除 {CF_PURGE_MAX} 个网址")
+    await _cf_call("POST", path, {"files": urls}, need=CF_NEED_PURGE)
+    _cf_audit(ctx, "purge", zone, None, {"files": urls})
+    return {"purged": len(urls)}
+
+
+# ---- 换 IP：找出所有域名里指向旧 IP 的 A / AAAA 记录，确认后批量改成新 IP
+
+def _cf_ip(text, what):
+    try:
+        return ipaddress.ip_address(str(text or "").strip())
+    except ValueError:
+        raise ApiError(f"{what}不是有效的 IP 地址")
+
+
+def _cf_ip_pair(p):
+    old = _cf_ip(p.get("old"), "旧 IP ")
+    new = _cf_ip(p.get("new"), "新 IP ")
+    if old.version != new.version:
+        raise ApiError("新旧 IP 要同一种类型（都是 IPv4 或都是 IPv6）")
+    if old == new:
+        raise ApiError("新旧 IP 一样，不用换")
+    return str(old), str(new), ("A" if old.version == 4 else "AAAA")
+
+
+async def _cf_matches(old, typ, zone_id=None):
+    """返回 [(zone, record_view)]：所有内容等于 old 的记录。"""
+    zones = await _cf_zones()
+    if zone_id:
+        zones = [z for z in zones if z["id"] == zone_id]
+    sem = asyncio.Semaphore(4)
+
+    async def one(z):
+        async with sem:
+            return z, await _cf_records(z)
+
+    out = []
+    for z, recs in await asyncio.gather(*(one(z) for z in zones)):
+        for r in recs:
+            if r["type"] == typ:
+                try:
+                    same = str(ipaddress.ip_address(r["content"])) == old
+                except ValueError:
+                    same = False
+                if same:
+                    out.append((z, r))
+    return out
+
+
+@action("cf_swap", admin=True)
+async def a_cf_swap(ctx, p):
+    """预览：只读，不会改任何东西。"""
+    old, new, typ = _cf_ip_pair(p)
+    found = await _cf_matches(old, typ, p.get("zone") or None)
+    return {"old": old, "new": new, "items": [
+        {"key": z["id"] + ":" + r["id"], "zone": z["name"], "name": r["name"], "type": r["type"],
+         "proxied": r["proxied"], "comment": r["comment"]} for z, r in found]}
+
+
+@action("cf_swap_edit", admin=True)
+async def a_cf_swap_edit(ctx, p):
+    need_rate(ctx["uid"], 1)
+    old, new, typ = _cf_ip_pair(p)
+    keys = p.get("keys")
+    if not isinstance(keys, list) or not keys:
+        raise ApiError("请至少勾选一条记录")
+    if len(keys) > 300:
+        raise ApiError("一次最多改 300 条")
+    want = {str(k) for k in keys}
+    found = [(z, r) for z, r in await _cf_matches(old, typ) if z["id"] + ":" + r["id"] in want]
+    sem = asyncio.Semaphore(4)
+
+    async def one(z, r):
+        async with sem:
+            try:
+                j = await _cf_call("PATCH", f"/zones/{z['id']}/dns_records/{r['id']}", {"content": new})
+                _cf_audit(ctx, "swap_ip", z, r, _cf_view(j["result"]))
+                return {"zone": z["name"], "name": r["name"], "ok": True}
+            except ApiError as e:
+                return {"zone": z["name"], "name": r["name"], "ok": False, "error": str(e)}
+
+    res = await asyncio.gather(*(one(z, r) for z, r in found))
+    return {"done": [x for x in res if x["ok"]], "failed": [x for x in res if not x["ok"]],
+            "missing": len(want) - len(found)}
 
 
 # ---------------------------------------------------------------- IP 信息 / IP 质量
@@ -1058,6 +1573,7 @@ def _ipdb_loop():
 async def start_server():
     server = await asyncio.start_server(handle, CONF["host"], int(CONF["port"]))
     threading.Thread(target=_ipdb_loop, daemon=True).start()
+    asyncio.get_running_loop().create_task(_dns_loop())
     print(f"Mini App 接口已启动：http://{CONF['host']}:{CONF['port']}")
     return server
 
@@ -1237,7 +1753,13 @@ async def a_server_edit(ctx, p):
         srv["name"] = clean(p.get("name"), 30)
         save_servers()
         return {"ok": True}
+    if op == "dns":
+        return await _dns_set(ctx, srv, p)
     if op == "del":
+        if srv.get("dns_parked"):
+            _ok, left = await _dns_unpark(srv, "被删除，先加回临时摘除的解析")
+            if left:
+                raise ApiError(f"这台还有 {len(left)} 条临时摘除的解析没能加回，请稍后再删")
         SERVERS.remove(srv)
         LIVE.pop(srv["id"], None)
         save_servers()
@@ -1262,6 +1784,284 @@ async def a_server_edit(ctx, p):
         return {"ok": True}
     raise ApiError("不支持的操作")
 
+
+
+# ---------------------------------------------------------------- 解析联动（探针 + Cloudflare）
+# 每台服务器两个开关（只有所有者能设置）：
+#   dns_auto     IP 变了自动改解析：探针从新 IPv4 连续上报 3 分钟，就把所有指向旧 IP 的 A 记录改成新 IP
+#   dns_failover 离线自动切换：探针离线 3 分钟，临时删掉指向它的 A 记录（同名还有其他在线服务器时才删）；
+#                恢复在线 2 分钟后按原样加回。被删的记录保存在 nav_servers.json 的 dns_parked 里，重启也不会丢。
+# 探针本身不用改：IP 和在线状态都来自现有的上报。
+
+DNS_IP_STABLE = 180        # 新 IP 连续出现这么久才算真的换了
+DNS_DOWN_AFTER = 180       # 离线这么久才摘除解析
+DNS_UP_STABLE = 120        # 恢复在线这么久才加回解析
+DNS_CHECK_EVERY = 20
+DNS_RETRY_EVERY = 300      # 摘除 / 加回失败后多久再试
+DNS_STATE = {}             # id -> 运行中的临时状态（不落盘）
+DNS_APP = {"app": None}
+DNS_BOOT = time.time()
+DNS_CTX = {"uid": "auto"}  # 写操作日志时的操作人
+
+
+def _ipn(v):
+    try:
+        return str(ipaddress.ip_address(str(v).strip()))
+    except ValueError:
+        return ""
+
+
+def _srv_online(srv):
+    live = LIVE.get(srv["id"])
+    return bool(live and time.time() - live["ts"] < OFFLINE_AFTER)
+
+
+def _cf_ready():
+    return bool((os.environ.get("CF_API_TOKEN") or CONF.get("cf_token") or "").strip())
+
+
+async def _dns_notify(text):
+    app = DNS_APP["app"]
+    print("解析联动：" + text.replace("\n", " | "))
+    if not app:
+        return
+    for uid in dh.ADMIN_IDS:
+        try:
+            await app.bot.send_message(chat_id=uid, text=text, disable_web_page_preview=True)
+        except Exception as e:
+            print("解析联动通知发送失败：", e)
+
+
+def _names(items, limit=12):
+    names = [x if isinstance(x, str) else x["name"] for x in items]
+    return "、".join(names[:limit]) + (f" 等 {len(names)} 条" if len(names) > limit else "")
+
+
+async def _dns_records_to(ip):
+    """[(zone, record_view)]：所有内容等于 ip 的 A 记录。"""
+    return await _cf_matches(ip, "A")
+
+
+async def _dns_swap(srv, old, new):
+    found = await _dns_records_to(old)
+    done, failed = [], []
+    for z, r in found:
+        try:
+            j = await _cf_call("PATCH", f"/zones/{z['id']}/dns_records/{r['id']}", {"content": new})
+            _cf_audit(DNS_CTX, "auto_swap_ip", z, r, _cf_view(j["result"]))
+            done.append(r["name"])
+        except ApiError as e:
+            failed.append(f"{r['name']}（{e}）")
+    msg = f"🔁 服务器「{srv['name']}」IP 变了：{old} → {new}\n"
+    if done:
+        msg += f"已自动更新 {len(done)} 条解析：{_names(done)}"
+    else:
+        msg += "Cloudflare 上没有指向旧 IP 的 A 记录，没有改动。"
+    if failed:
+        msg += f"\n❌ 失败 {len(failed)} 条：{_names(failed, 6)}，请到「解析」里手动修改。"
+    await _dns_notify(msg)
+
+
+async def _dns_ip_check(srv):
+    """IP 变化检测：只看 IPv4。"""
+    st = DNS_STATE.setdefault(srv["id"], {})
+    live = LIVE.get(srv["id"])
+    ip = _ipn(live.get("ip4") or "") if live and _srv_online(srv) else ""
+    if not ip or ":" in ip:
+        st.pop("new_ip", None)
+        return
+    known = srv.get("dns_ip")
+    if not known:
+        srv["dns_ip"] = ip
+        save_servers()
+        return
+    if ip == known:
+        st.pop("new_ip", None)
+        return
+    if st.get("new_ip") != ip:
+        st["new_ip"], st["since"] = ip, time.time()
+        return
+    if time.time() - st["since"] < DNS_IP_STABLE:
+        return
+    st.pop("new_ip", None)
+    srv["dns_ip"] = ip
+    for x in srv.get("dns_parked") or []:      # 正在摘除中的记录，加回时用新 IP
+        if x.get("content") == known:
+            x["content"] = ip
+    save_servers()
+    if srv.get("dns_auto"):
+        await _dns_swap(srv, known, ip)
+
+
+async def _dns_park(srv, ip, minutes):
+    offline = {ip}                          # 所有离线服务器的 IP（开没开联动都算）
+    for s in SERVERS:
+        if not _srv_online(s):
+            live = LIVE.get(s["id"]) or {}
+            offline |= {x for x in (s.get("dns_ip"), _ipn(live.get("ip4") or "")) if x}
+    parked, kept = [], []
+    for z in await _cf_zones():
+        recs = await _cf_records(z)
+        for r in recs:
+            if r["type"] != "A" or _ipn(r["content"]) != ip:
+                continue
+            others = [o for o in recs if o["id"] != r["id"] and o["type"] == "A" and o["name"] == r["name"]
+                      and _ipn(o["content"]) not in offline]
+            if not others:                 # 同名没有其他可用服务器：删了也没用，保留
+                kept.append(r["name"])
+                continue
+            try:
+                await _cf_call("DELETE", f"/zones/{z['id']}/dns_records/{r['id']}")
+            except ApiError as e:
+                kept.append(f"{r['name']}（删除失败：{e}）")
+                continue
+            _cf_audit(DNS_CTX, "auto_park", z, r, None)
+            parked.append({"zone": z["id"], "zone_name": z["name"], "type": r["type"], "name": r["name"],
+                           "content": r["content"], "ttl": r["ttl"], "proxied": r["proxied"], "comment": r["comment"]})
+    if parked:
+        srv["dns_parked"] = (srv.get("dns_parked") or []) + parked
+        save_servers()
+    st = DNS_STATE.setdefault(srv["id"], {})
+    if not parked and set(kept) == st.get("kept_told", set()):
+        return                              # 没有新变化：不重复提醒
+    st["kept_told"] = set(kept)
+    if not parked and not kept:
+        return
+    msg = f"⚠️ 服务器「{srv['name']}」（{ip}）离线超过 {minutes} 分钟"
+    if parked:
+        msg += f"\n已临时摘除 {len(parked)} 条解析，流量切到同名的其他服务器：{_names(parked)}\n恢复在线后会自动加回。"
+    if kept:
+        msg += f"\n以下记录没有其他可用服务器，保留未动：{_names(kept, 6)}"
+    await _dns_notify(msg)
+
+
+async def _dns_unpark(srv, why):
+    parked = srv.get("dns_parked") or []
+    if not parked:
+        return [], []
+    ip = srv.get("dns_ip")
+    ok, left = [], []
+    for x in parked:
+        body = {"type": x["type"], "name": x["name"], "content": ip or x["content"], "ttl": x.get("ttl", 1),
+                "proxied": bool(x.get("proxied")), "comment": x.get("comment") or ""}
+        try:
+            j = await _cf_call("POST", f"/zones/{x['zone']}/dns_records", body)
+            _cf_audit(DNS_CTX, "auto_unpark", {"name": x.get("zone_name", "")}, None, _cf_view(j["result"]))
+            ok.append(x["name"])
+        except ApiError as e:
+            if "already exist" in str(e).lower():      # 你已经手动加回了
+                ok.append(x["name"])
+            else:
+                left.append(x)
+    srv["dns_parked"] = left
+    save_servers()
+    msg = f"✅ 服务器「{srv['name']}」{why}"
+    if ok:
+        msg += f"\n已加回 {len(ok)} 条解析：{_names(ok)}"
+    if left:
+        msg += f"\n❌ 还有 {len(left)} 条加回失败，稍后会自动重试：{_names(left, 6)}"
+    await _dns_notify(msg)
+    return ok, left
+
+
+async def _dns_failover_check(srv):
+    if not srv.get("dns_failover"):
+        return
+    ip = srv.get("dns_ip")
+    if not ip:
+        return
+    st = DNS_STATE.setdefault(srv["id"], {})
+    now = time.time()
+    live = LIVE.get(srv["id"])
+    if live:
+        down_for = now - live["ts"]
+    else:
+        down_for = now - DNS_BOOT          # 机器人重启后一直没收到这台的数据
+    online = down_for < OFFLINE_AFTER
+    if online:
+        st.pop("park_tried", None)
+        st.pop("kept_told", None)
+        if srv.get("dns_parked"):
+            st.setdefault("up_since", now)
+            if now - st["up_since"] >= DNS_UP_STABLE and now - st.get("unpark_try", 0) >= DNS_RETRY_EVERY:
+                st["unpark_try"] = now
+                _ok, left = await _dns_unpark(srv, "已恢复在线")
+                if not left:
+                    st.pop("up_since", None)
+                    st.pop("unpark_try", None)
+        return
+    st.pop("up_since", None)
+    if down_for < DNS_DOWN_AFTER or now - DNS_BOOT < DNS_DOWN_AFTER:
+        return
+    if now - st.get("park_tried", 0) < DNS_RETRY_EVERY:
+        return
+    st["park_tried"] = now
+    await _dns_park(srv, ip, int(down_for // 60))
+
+
+async def _dns_loop():
+    await asyncio.sleep(15)
+    while True:
+        try:
+            if _cf_ready():
+                for srv in list(SERVERS):
+                    if not (srv.get("dns_auto") or srv.get("dns_failover")):
+                        continue
+                    try:
+                        await _dns_ip_check(srv)
+                        await _dns_failover_check(srv)
+                    except ApiError as e:
+                        print("解析联动出错：", srv.get("name"), e)
+                    except Exception as e:
+                        print("解析联动出错：", srv.get("name"), repr(e))
+        except Exception as e:
+            print("解析联动循环出错：", repr(e))
+        await asyncio.sleep(DNS_CHECK_EVERY)
+
+
+def _dns_need_owner(ctx):
+    if not dh.is_owner(ctx["uid"]):
+        raise ApiError("只有所有者可以设置解析联动", 403)
+
+
+async def _dns_info(srv):
+    live = LIVE.get(srv["id"])
+    ip = srv.get("dns_ip") or (_ipn(live.get("ip4") or "") if live else "")
+    recs = [{"zone": z["name"], "name": r["name"], "proxied": r["proxied"]} for z, r in await _dns_records_to(ip)] if ip else []
+    st = DNS_STATE.get(srv["id"]) or {}
+    return {"auto": bool(srv.get("dns_auto")), "failover": bool(srv.get("dns_failover")),
+            "ip": ip, "live_ip": _ipn(live.get("ip4") or "") if live else "", "pending_ip": st.get("new_ip") or "",
+            "records": recs, "parked": [{"zone": x.get("zone_name", ""), "name": x["name"]} for x in srv.get("dns_parked") or []],
+            "online": _srv_online(srv)}
+
+
+@action("server_dns", admin=True)
+async def a_server_dns(ctx, p):
+    _dns_need_owner(ctx)
+    _cf_token()
+    return await _dns_info(_find_server(p, ctx["uid"]))
+
+
+async def _dns_set(ctx, srv, p):
+    _dns_need_owner(ctx)
+    _cf_token()
+    auto, fo = bool(p.get("auto")), bool(p.get("failover"))
+    if (auto or fo) and not srv.get("dns_ip"):
+        live = LIVE.get(srv["id"])
+        ip = _ipn(live.get("ip4") or "") if live else ""
+        if not ip or ":" in ip:
+            raise ApiError("还没收到这台服务器的 IPv4，等探针在线后再开启")
+        srv["dns_ip"] = ip
+    if not fo and srv.get("dns_parked"):
+        _ok, left = await _dns_unpark(srv, "关闭了离线自动切换")
+        if left:
+            raise ApiError(f"有 {len(left)} 条摘除的解析没能加回，请稍后再试")
+    srv["dns_auto"], srv["dns_failover"] = auto, fo
+    if not auto and not fo:
+        srv.pop("dns_ip", None)          # 都关了：下次开启时重新记住当时的 IP
+        DNS_STATE.pop(srv["id"], None)
+    save_servers()
+    return await _dns_info(srv)
 
 
 # ---------------------------------------------------------------- 首页按钮 / 欢迎语
@@ -1385,6 +2185,7 @@ _orig_post_init = dh.post_init
 
 async def post_init(application):
     await _orig_post_init(application)
+    DNS_APP["app"] = application
     try:
         from telegram.ext import CallbackQueryHandler
         application.add_handler(CallbackQueryHandler(servers_cb, pattern=r"^srv_home$"), group=-1)
