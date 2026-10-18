@@ -1804,8 +1804,8 @@ async def a_server_edit(ctx, p):
 
 
 # ---------------------------------------------------------------- 服务器带宽测速
-# 操作台点「测速」→ 下一次探针上报时回一个 cmd=speedtest → 探针（v4 起）在后台向 Cloudflare 测速节点
-# 测下载 / 上传各约 10 秒，把进度和结果夹在之后的上报里带回来；收到结果后回 ack，探针就不再带。
+# 操作台点「测速」→ 下一次探针上报时回一个 cmd=speedtest → 探针（v4 起）在后台测下载 / 上传各约 10 秒
+# （v5 起测速点自动切换：Cloudflare → Ookla Speedtest → 公共测速文件），把进度和结果夹在之后的上报里带回来；收到结果后回 ack，探针就不再带。
 # 只记最后一次结果（存在 nav_servers.json 的 speed 字段）。旧版探针 / bash 版探针不支持，需要重装一次。
 
 SPEED_RUN = {}              # id -> {"sid","state":wait|run|done|err,"phase","d","u","ping","node","err","t0","seen"}
