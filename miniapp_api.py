@@ -1598,29 +1598,33 @@ async def start_server():
 # 再转给本接口的 /probe。目标机器不用开任何端口。登记的服务器保存在 SERVERS_FILE。
 
 SERVERS_FILE = CONF.get("servers_file") or _data_path("nav_servers.json")
-SERVER_LIMIT = 60
+SERVER_LIMIT = 200
+GROUP_LIMIT = 30           # 每个人最多建多少个分组
 OFFLINE_AFTER = 30          # 超过这么多秒没收到数据就算离线
-SERVERS = []                # [{"id","name","token","created"}]
+SERVERS = []                # [{"id","name","token","created","owner","group"}]
+GROUPS = {}                 # 每个人的服务器分组（按顺序）：{"<uid>": ["香港", "日本", ...]}
 LIVE = {}                   # id -> {"ts", "ip", "m": {...}}
 
 
 def load_servers():
-    global SERVERS
+    global SERVERS, GROUPS
     try:
         with open(SERVERS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         SERVERS = [x for x in data.get("servers", []) if x.get("id") and x.get("token")]
+        g = data.get("groups")
+        GROUPS = {str(k): [str(n) for n in v if n] for k, v in g.items() if isinstance(v, list)} if isinstance(g, dict) else {}
     except FileNotFoundError:
-        SERVERS = []
+        SERVERS, GROUPS = [], {}
     except Exception as e:
         print("多服务器列表读取失败：", e)
-        SERVERS = []
+        SERVERS, GROUPS = [], {}
 
 
 def save_servers():
     tmp = SERVERS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"servers": SERVERS}, f, ensure_ascii=False, indent=1)
+        json.dump({"servers": SERVERS, "groups": GROUPS}, f, ensure_ascii=False, indent=1)
     os.chmod(tmp, 0o600)
     os.replace(tmp, SERVERS_FILE)
 
@@ -1698,7 +1702,7 @@ def _pct(part, whole):
 def server_view(srv):
     live = LIVE.get(srv["id"])
     age = (time.time() - live["ts"]) if live else None
-    out = {"id": srv["id"], "name": srv["name"], "uninstall": bool(srv.get("uninstall")), "online": bool(live and age < OFFLINE_AFTER),
+    out = {"id": srv["id"], "name": srv["name"], "group": srv.get("group") or "", "uninstall": bool(srv.get("uninstall")), "online": bool(live and age < OFFLINE_AFTER),
            "age": int(age) if age is not None else None, "seen": bool(live)}
     if live:
         m = live["m"]
@@ -1742,10 +1746,27 @@ def _find_server(p, uid):
     raise ApiError("这台服务器不存在或已被删除", 404)
 
 
+def _groups_of(uid):
+    """这个人的分组（按他排好的顺序）；服务器上记着、但列表里没有的组名也补进来。"""
+    gl = list(GROUPS.get(str(uid), []))
+    for s in my_servers(uid):
+        g = s.get("group")
+        if g and g not in gl:
+            gl.append(g)
+    return gl
+
+
+def _group_name(v):
+    name = clean(v, 20).strip()
+    if not name:
+        raise ApiError("分组名称不能为空")
+    return name
+
+
 @action("servers", admin=True)
 async def a_servers(ctx, p):
     items = [server_view(s) for s in my_servers(ctx["uid"])]
-    return {"items": items, **servers_summary(ctx["uid"])}
+    return {"items": items, "groups": _groups_of(ctx["uid"]), "limit": SERVER_LIMIT, **servers_summary(ctx["uid"])}
 
 
 @action("server_get", admin=True)
@@ -1756,11 +1777,52 @@ async def a_server_get(ctx, p):
 @action("server_edit", admin=True)
 async def a_server_edit(ctx, p):
     op = p.get("op")
+    uid, key = ctx["uid"], str(ctx["uid"])
+    # ---- 分组：新建 / 改名 / 删除 / 调整顺序（不针对某一台服务器）
+    if op == "group_add":
+        name, gl = _group_name(p.get("name")), _groups_of(uid)
+        if name in gl:
+            raise ApiError("已经有这个分组了")
+        if len(gl) >= GROUP_LIMIT:
+            raise ApiError(f"最多 {GROUP_LIMIT} 个分组")
+        GROUPS[key] = gl + [name]
+        save_servers()
+        return {"groups": GROUPS[key]}
+    if op == "group_rename":
+        old, new, gl = str(p.get("old") or ""), _group_name(p.get("name")), _groups_of(uid)
+        if old not in gl:
+            raise ApiError("这个分组不存在")
+        if new != old and new in gl:
+            raise ApiError("已经有这个分组了")
+        GROUPS[key] = [new if g == old else g for g in gl]
+        for s in my_servers(uid):
+            if s.get("group") == old:
+                s["group"] = new
+        save_servers()
+        return {"groups": GROUPS[key]}
+    if op == "group_del":
+        old, gl = str(p.get("name") or ""), _groups_of(uid)
+        GROUPS[key] = [g for g in gl if g != old]
+        n = 0
+        for s in my_servers(uid):
+            if s.get("group") == old:
+                s.pop("group", None)
+                n += 1
+        save_servers()
+        return {"groups": GROUPS[key], "moved": n}     # 组里的服务器回到「未分组」，不会被删
+    if op == "group_order":
+        gl, want = _groups_of(uid), [str(x) for x in (p.get("groups") or []) if isinstance(x, str)]
+        GROUPS[key] = [g for g in want if g in gl] + [g for g in gl if g not in want]
+        save_servers()
+        return {"groups": GROUPS[key]}
     if op == "add":
         if len(SERVERS) >= SERVER_LIMIT:
             raise ApiError(f"最多添加 {SERVER_LIMIT} 台服务器")
         name = clean(p.get("name"), 30)
         srv = {"id": secrets.token_hex(4), "name": name, "token": secrets.token_hex(16), "created": int(time.time()), "owner": ctx["uid"]}
+        grp = str(p.get("group") or "")
+        if grp and grp in _groups_of(uid):
+            srv["group"] = grp
         cmd = install_cmd(srv)                  # 先确认能生成命令，再保存
         SERVERS.append(srv)
         save_servers()
@@ -1770,6 +1832,16 @@ async def a_server_edit(ctx, p):
         srv["name"] = clean(p.get("name"), 30)
         save_servers()
         return {"ok": True}
+    if op == "group":                                   # 把这台放进某个分组；空 = 未分组
+        grp = str(p.get("group") or "")
+        if grp and grp not in _groups_of(uid):
+            raise ApiError("这个分组不存在")
+        if grp:
+            srv["group"] = grp
+        else:
+            srv.pop("group", None)
+        save_servers()
+        return {"ok": True, "group": grp}
     if op == "dns":
         return await _dns_set(ctx, srv, p)
     if op == "del":
@@ -2202,12 +2274,17 @@ LAT_DATA.setdefault("pts", {})      # sid -> [[ts, [ms, 丢包%] 或 None, ×3],
 LAT_DATA.setdefault("ip", {})       # sid -> 上次测的 IP（服务器离线时继续测它）
 
 
+LAT_HOURLY_MAX = 200        # Globalping 免费额度有限：每小时最多发这么多次检测
+
+
 def _lat_every():
+    """检测间隔：默认 15 分钟；服务器多了自动拉长，保证每小时不超过 LAT_HOURLY_MAX 次（200 台时约 1 小时一轮）。"""
     try:
         v = int(CONF.get("latency_every") or 900)
     except (TypeError, ValueError):
         v = 900
-    return max(300, v)
+    need = len(SERVERS) * 3600 // LAT_HOURLY_MAX
+    return max(300, v, need)
 
 
 def _lat_save():
