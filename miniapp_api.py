@@ -742,7 +742,9 @@ CF_EXP_FILE = _data_path("cf_expiry.json")
 CF_EXP_TTL = 12 * 3600
 CF_EXP_FAIL_TTL = 3600
 CF_EXP_BUSY = set()
+CF_EXP_TASKS = set()       # 保留后台任务的引用，避免被回收
 CF_RDAP_BOOT = {"t": 0, "map": {}}
+CF_RDAP_LOCK = threading.Lock()
 try:
     with open(CF_EXP_FILE, "r", encoding="utf-8") as _f:
         CF_EXP = json.load(_f)
@@ -765,7 +767,7 @@ def _exp_parse(s):
     return 0
 
 
-def _http_json(url, timeout=10):
+def _http_json(url, timeout=8):
     req = urllib.request.Request(url, headers={"Accept": "application/rdap+json, application/json",
                                                "User-Agent": "nav-miniapp/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -773,6 +775,12 @@ def _http_json(url, timeout=10):
 
 
 def _rdap_base(tld):
+    with CF_RDAP_LOCK:
+        _rdap_boot()
+    return CF_RDAP_BOOT["map"].get(tld)
+
+
+def _rdap_boot():
     if time.time() - CF_RDAP_BOOT["t"] > 86400 or not CF_RDAP_BOOT["map"]:
         try:
             m = {}
@@ -784,7 +792,6 @@ def _rdap_base(tld):
         except Exception as e:
             print("RDAP 列表下载失败：", e)
             CF_RDAP_BOOT["t"] = time.time() - 86400 + 600     # 10 分钟后再试
-    return CF_RDAP_BOOT["map"].get(tld)
 
 
 def _rdap_expiry(name):
@@ -802,7 +809,7 @@ def _rdap_expiry(name):
 
 def _whois_query(server, q):
     import socket
-    with socket.create_connection((server, 43), timeout=10) as s:
+    with socket.create_connection((server, 43), timeout=8) as s:
         s.sendall((q + "\r\n").encode())
         buf = b""
         while len(buf) < 200000:
@@ -842,18 +849,24 @@ def _exp_lookup(name):
 
 
 async def _exp_refresh(names):
-    changed = False
-    for n in names:
-        if n in CF_EXP_BUSY:
-            continue
-        CF_EXP_BUSY.add(n)
+    names = [n for n in names if n not in CF_EXP_BUSY]
+    if not names:
+        return
+    CF_EXP_BUSY.update(names)
+
+    async def one(n):
         try:
             ts, err = await asyncio.to_thread(_exp_lookup, n)
-            CF_EXP[n] = {"exp": ts, "t": int(time.time()), "err": err}
-            changed = True
-        finally:
-            CF_EXP_BUSY.discard(n)
-    if changed:
+        except Exception as e:
+            print("到期日查询出错：", n, repr(e))
+            ts, err = 0, "查不到到期日"
+        CF_EXP[n] = {"exp": ts, "t": int(time.time()), "err": err}
+
+    try:
+        await asyncio.gather(*(one(n) for n in names))     # 几个域名同时查
+    finally:
+        CF_EXP_BUSY.difference_update(names)
+    if True:
         try:
             tmp = CF_EXP_FILE + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -874,7 +887,9 @@ def _exp_attach(zones, force=False):
             stale.append(z["name"])
         out.append(dict(z, exp=c.get("exp") or 0, exp_err=c.get("err") or ""))
     if stale:
-        asyncio.get_running_loop().create_task(_exp_refresh(stale))
+        task = asyncio.get_running_loop().create_task(_exp_refresh(stale))
+        CF_EXP_TASKS.add(task)
+        task.add_done_callback(CF_EXP_TASKS.discard)
     pending = any(not (CF_EXP.get(n) or {}) for n in stale) or (force and bool(stale))
     return out, pending
 
