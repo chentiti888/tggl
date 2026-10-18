@@ -1826,7 +1826,7 @@ def _speed_probe(srv, m, sp):
         sid = _txt(sp.get("sid"), 20)
         if st and sid == st["sid"] and st["state"] in ("wait", "run"):
             st.update(phase=_txt(sp.get("phase"), 2), d=_spd_val(sp.get("d")), u=_spd_val(sp.get("u")),
-                      ping=_spd_val(sp.get("ping"), 1e5), node=_txt(sp.get("node"), 8), seen=time.time())
+                      ping=_spd_val(sp.get("ping"), 1e5), node=_txt(sp.get("node"), 24), seen=time.time())
             if sp.get("err"):
                 st.update(state="err", err=_txt(sp.get("err"), 80))
                 resp["ack"] = sid
