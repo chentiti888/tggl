@@ -1588,7 +1588,8 @@ def _ipdb_loop():
 async def start_server():
     server = await asyncio.start_server(handle, CONF["host"], int(CONF["port"]))
     threading.Thread(target=_ipdb_loop, daemon=True).start()
-    asyncio.get_running_loop().create_task(_dns_loop())
+    for coro in (_dns_loop(), _lat_loop()):       # 后台循环：保留引用，避免被回收
+        LAT_TASKS.add(asyncio.get_running_loop().create_task(coro))
     print(f"Mini App 接口已启动：http://{CONF['host']}:{CONF['port']}")
     return server
 
@@ -1684,9 +1685,10 @@ def probe_report(headers, raw):
         # 已通知探针卸载自己：把这台从列表里移除
         SERVERS.remove(found)
         LIVE.pop(found["id"], None)
+        SPEED_RUN.pop(found["id"], None)
         save_servers()
         return 200, {"ok": True, "cmd": "uninstall"}
-    return 200, {"ok": True}
+    return 200, _speed_probe(found, m, p.get("spd"))
 
 
 def _pct(part, whole):
@@ -1799,6 +1801,90 @@ async def a_server_edit(ctx, p):
         return {"ok": True}
     raise ApiError("不支持的操作")
 
+
+
+# ---------------------------------------------------------------- 服务器带宽测速
+# 操作台点「测速」→ 下一次探针上报时回一个 cmd=speedtest → 探针（v4 起）在后台向 Cloudflare 测速节点
+# 测下载 / 上传各约 10 秒，把进度和结果夹在之后的上报里带回来；收到结果后回 ack，探针就不再带。
+# 只记最后一次结果（存在 nav_servers.json 的 speed 字段）。旧版探针 / bash 版探针不支持，需要重装一次。
+
+SPEED_RUN = {}              # id -> {"sid","state":wait|run|done|err,"phase","d","u","ping","node","err","t0","seen"}
+SPEED_MIN_VER = 4
+SPEED_STALL = 60            # 这么久没收到进度就算失败
+
+
+def _spd_val(v, hi=1e6):
+    if v is None:
+        return None
+    return round(_num(v, 0, hi), 2)
+
+
+def _speed_probe(srv, m, sp):
+    resp = {"ok": True}
+    st = SPEED_RUN.get(srv["id"])
+    if isinstance(sp, dict) and sp.get("sid"):
+        sid = _txt(sp.get("sid"), 20)
+        if st and sid == st["sid"] and st["state"] in ("wait", "run"):
+            st.update(phase=_txt(sp.get("phase"), 2), d=_spd_val(sp.get("d")), u=_spd_val(sp.get("u")),
+                      ping=_spd_val(sp.get("ping"), 1e5), node=_txt(sp.get("node"), 8), seen=time.time())
+            if sp.get("err"):
+                st.update(state="err", err=_txt(sp.get("err"), 80))
+                resp["ack"] = sid
+            elif sp.get("done"):
+                st["state"] = "done"
+                srv["speed"] = {"d": st["d"], "u": st["u"], "ping": st["ping"], "node": st["node"], "ts": int(time.time())}
+                save_servers()
+                resp["ack"] = sid
+            else:
+                st["state"] = "run"
+        elif not st or sid != st["sid"] or st["state"] in ("done", "err"):
+            resp["ack"] = sid          # 过期的结果：让探针丢掉
+    if st and st["state"] == "wait" and m.get("ver", 0) >= SPEED_MIN_VER:
+        resp["cmd"] = "speedtest"
+        resp["sid"] = st["sid"]
+    return resp
+
+
+def _speed_state(srv):
+    st = SPEED_RUN.get(srv["id"])
+    if not st:
+        return None
+    if st["state"] in ("wait", "run") and time.time() - max(st["t0"], st.get("seen") or 0) > SPEED_STALL:
+        st.update(state="err", err="探针没有回应，请稍后再试")
+    return {k: st.get(k) for k in ("state", "phase", "d", "u", "ping", "node", "err")}
+
+
+@action("speed", admin=True)
+async def a_speed(ctx, p):
+    items = []
+    for s in my_servers(ctx["uid"]):
+        live = LIVE.get(s["id"])
+        items.append({"id": s["id"], "name": s["name"],
+                      "online": bool(live and time.time() - live["ts"] < OFFLINE_AFTER),
+                      "ver": live["m"].get("ver", 0) if live else 0,
+                      "last": s.get("speed"), "run": _speed_state(s)})
+    return {"items": items, "min_ver": SPEED_MIN_VER}
+
+
+@action("speed_edit", admin=True)
+async def a_speed_edit(ctx, p):
+    if p.get("op") != "run":
+        raise ApiError("不支持的操作")
+    srv = _find_server(p, ctx["uid"])
+    live = LIVE.get(srv["id"])
+    if not live or time.time() - live["ts"] >= OFFLINE_AFTER:
+        raise ApiError("这台服务器不在线")
+    if live["m"].get("ver", 0) < SPEED_MIN_VER:
+        raise ApiError("这台的探针是旧版，不支持测速：在这台服务器上重新执行一次安装命令就行")
+    st = _speed_state(srv)
+    if st and st["state"] in ("wait", "run"):
+        raise ApiError("这台正在测速")
+    running = sum(1 for x in SPEED_RUN.values() if x["state"] in ("wait", "run"))
+    if running >= 3:
+        raise ApiError("同时最多测 3 台，请等一会儿")
+    SPEED_RUN[srv["id"]] = {"sid": secrets.token_hex(4), "state": "wait", "phase": "", "d": None, "u": None,
+                            "ping": None, "node": "", "err": "", "t0": time.time(), "seen": 0}
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- 解析联动（探针 + Cloudflare）
@@ -2093,6 +2179,203 @@ async def _dns_set(ctx, srv, p):
     return await _dns_info(srv)
 
 
+# ---------------------------------------------------------------- 延迟监控（从国内电信 / 联通 / 移动 ping 各台服务器）
+# 每隔 latency_every 秒（默认 900 = 15 分钟，可在 nav_miniapp.json 里改，最少 300）用 Globalping 的国内探针测一轮，
+# 每台服务器一次测量、三个运营商各一个探针、每个探针 4 个包。结果存 nav_latency.json，保留 7 天。
+LAT_FILE = _data_path("nav_latency.json")
+LAT_KEEP = 7 * 86400
+LAT_CARRIERS = (
+    ("电信", 4134, {4134, 4809, 4811, 4812, 4813, 4816, 23724, 134774}),
+    ("联通", 4837, {4837, 4808, 9929, 17621, 17622, 17623, 17816}),
+    ("移动", 9808, {9808, 9394, 24400, 24444, 24445, 56040, 56041, 56042, 56044, 56046, 56047, 56048}),
+)
+LAT_STATE = {"last": 0, "running": False, "manual": 0}
+LAT_TASKS = set()
+try:
+    with open(LAT_FILE, "r", encoding="utf-8") as _f:
+        LAT_DATA = json.load(_f)
+    if not isinstance(LAT_DATA, dict):
+        raise ValueError
+except Exception:
+    LAT_DATA = {}
+LAT_DATA.setdefault("pts", {})      # sid -> [[ts, [ms, 丢包%] 或 None, ×3], ...]；ms 为 None 表示不通
+LAT_DATA.setdefault("ip", {})       # sid -> 上次测的 IP（服务器离线时继续测它）
+
+
+def _lat_every():
+    try:
+        v = int(CONF.get("latency_every") or 900)
+    except (TypeError, ValueError):
+        v = 900
+    return max(300, v)
+
+
+def _lat_save():
+    try:
+        tmp = LAT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(LAT_DATA, f, separators=(",", ":"))
+        os.replace(tmp, LAT_FILE)
+    except Exception as e:
+        print("延迟数据保存失败：", e)
+
+
+def _lat_ip(srv):
+    live = LIVE.get(srv["id"]) or {}
+    return _ipn(live.get("ip4") or "") or srv.get("dns_ip") or LAT_DATA["ip"].get(srv["id"], "")
+
+
+def _lat_measure_sync(ip):
+    body = {"type": "ping", "target": ip,
+            "locations": [{"country": "CN", "asn": asn, "limit": 1} for _n, asn, _s in LAT_CARRIERS],
+            "measurementOptions": {"packets": 4}}
+    out = [None, None, None]
+    for item in dh._gp_run(body, timeout=30) or []:
+        probe = item.get("probe") or {}
+        res = item.get("result") or {}
+        st = res.get("stats") or {}
+        try:
+            asn = int(probe.get("asn") or 0)
+        except (TypeError, ValueError):
+            asn = 0
+        for i, (_n, _a, asns) in enumerate(LAT_CARRIERS):
+            if asn in asns and out[i] is None:
+                avg, loss = st.get("avg"), st.get("loss")
+                try:
+                    loss = float(loss) if loss is not None else (0.0 if avg is not None else 100.0)
+                except (TypeError, ValueError):
+                    loss = 100.0
+                if avg is None or loss >= 100:
+                    out[i] = [None, 100]
+                else:
+                    out[i] = [round(float(avg), 1), int(round(loss))]
+    return out
+
+
+async def _lat_round():
+    if LAT_STATE["running"]:
+        return
+    LAT_STATE["running"] = True
+    LAT_STATE["last"] = time.time()
+    try:
+        sem = asyncio.Semaphore(2)
+
+        async def one(srv):
+            ip = _lat_ip(srv)
+            if not ip:
+                return
+            async with sem:
+                try:
+                    r = await asyncio.to_thread(_lat_measure_sync, ip)
+                except Exception as e:
+                    print("延迟检测失败：", srv.get("name"), str(e)[:120])
+                    return
+            if r == [None, None, None]:
+                return
+            LAT_DATA["ip"][srv["id"]] = ip
+            LAT_DATA["pts"].setdefault(srv["id"], []).append([int(time.time())] + r)
+
+        await asyncio.gather(*(one(s) for s in list(SERVERS)))
+        cut = time.time() - LAT_KEEP
+        ids = {s["id"] for s in SERVERS}
+        LAT_DATA["pts"] = {k: [p for p in v if p[0] >= cut] for k, v in LAT_DATA["pts"].items() if k in ids}
+        LAT_DATA["ip"] = {k: v for k, v in LAT_DATA["ip"].items() if k in ids}
+        _lat_save()
+    finally:
+        LAT_STATE["running"] = False
+
+
+async def _lat_loop():
+    await asyncio.sleep(45)
+    while True:
+        try:
+            if SERVERS and time.time() - LAT_STATE["last"] >= _lat_every():
+                await _lat_round()
+        except Exception as e:
+            print("延迟监控出错：", repr(e))
+        await asyncio.sleep(30)
+
+
+def _lat_avg(vals):
+    vals = [v for v in vals if v is not None]
+    return round(sum(vals) / len(vals), 1) if vals else None
+
+
+@action("lat", admin=True)
+async def a_lat(ctx, p):
+    """首页卡片和详情页用的总览：可用率、三网平均延迟、24 小时走势、每台服务器最新结果。"""
+    now, ev = time.time(), _lat_every()
+    mine = my_servers(ctx["uid"])
+    buckets, checks, ok, last_ts, servers = {}, 0, 0, 0, []
+    for s in mine:
+        pts = [x for x in LAT_DATA["pts"].get(s["id"], []) if x[0] >= now - 86400]
+        for x in pts:
+            b = buckets.setdefault(int(x[0] // ev), [[], [], []])
+            for i in range(3):
+                v = x[i + 1]
+                if v is None:
+                    continue
+                checks += 1
+                if v[0] is not None:
+                    ok += 1
+                    b[i].append(v[0])
+        last = pts[-1] if pts else None
+        if last:
+            last_ts = max(last_ts, last[0])
+        servers.append({"id": s["id"], "name": s["name"], "ip": LAT_DATA["ip"].get(s["id"], ""),
+                        "ts": last[0] if last else 0,
+                        "v": [None if v is None else {"ms": v[0], "loss": v[1]} for v in last[1:]] if last else None})
+    keys = sorted(buckets)
+    isp = []
+    for i, (name, _a, _s) in enumerate(LAT_CARRIERS):
+        cur = [sv["v"][i]["ms"] for sv in servers if sv["v"] and sv["v"][i] and sv["v"][i]["ms"] is not None]
+        isp.append({"name": name, "avg": _lat_avg(cur), "series": [_lat_avg(buckets[k][i]) for k in keys]})
+    return {"every": ev, "last": last_ts, "running": LAT_STATE["running"],
+            "avail": round(ok * 100 / checks, 1) if checks else None, "isp": isp, "servers": servers}
+
+
+@action("lat_server", admin=True)
+async def a_lat_server(ctx, p):
+    srv = _find_server(p, ctx["uid"])
+    span = 7 * 86400 if p.get("range") == "7d" else 86400
+    pts = [x for x in LAT_DATA["pts"].get(srv["id"], []) if x[0] >= time.time() - span]
+    if span > 86400 and len(pts) > 200:          # 7 天的数据按小时合并，曲线不会太密
+        merged, cur = [], None
+        for x in pts:
+            h = x[0] // 3600
+            if not cur or cur[0] != h:
+                cur = [h, []]
+                merged.append(cur)
+            cur[1].append(x)
+        pts = []
+        for h, xs in merged:
+            row = [int(h * 3600)]
+            for i in range(3):
+                vs = [x[i + 1] for x in xs if x[i + 1] is not None]
+                if not vs:
+                    row.append(None)
+                    continue
+                ms = [v[0] for v in vs if v[0] is not None]
+                row.append([_lat_avg(ms), int(round(sum(v[1] for v in vs) / len(vs)))])
+            pts.append(row)
+    return {"id": srv["id"], "name": srv["name"], "pts": pts}
+
+
+@action("lat_edit", admin=True)
+async def a_lat_edit(ctx, p):
+    if p.get("op") != "run":
+        raise ApiError("未知操作")
+    if LAT_STATE["running"]:
+        return {"started": False, "msg": "正在检测中"}
+    if time.time() - LAT_STATE["manual"] < 120:
+        raise ApiError("刚检测过，请 2 分钟后再试")
+    LAT_STATE["manual"] = time.time()
+    task = asyncio.get_running_loop().create_task(_lat_round())
+    LAT_TASKS.add(task)
+    task.add_done_callback(LAT_TASKS.discard)
+    return {"started": True}
+
+
 # ---------------------------------------------------------------- 首页按钮 / 欢迎语
 # 在 nav_miniapp.json 里填 "web_url"（Mini App 的网址），机器人首页就会多一个「打开操作台」按钮，
 # 新用户 /start 的欢迎页也会提示点它。web_url 留空则不改动机器人。
@@ -2106,9 +2389,18 @@ def _web_url():
     return url if url.startswith("https://") else ""
 
 
+def _app_url():
+    """机器人按钮打开的地址：设置了 entry_key 时自动带上 ?k=密钥（网站 config.php 里要填同一个值）。"""
+    url = _web_url()
+    key = str(CONF.get("entry_key") or "").strip()
+    if url and key:
+        url = url.rstrip("/") + "/?k=" + urllib.parse.quote(key, safe="")
+    return url
+
+
 def main_menu_keyboard(user_id=None):
     markup = _orig_keyboard(user_id)
-    url = _web_url()
+    url = _app_url()
     if not url or user_id is None or not dh.can_use_tools(user_id):
         return markup
     try:
