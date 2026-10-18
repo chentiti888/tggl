@@ -1009,7 +1009,11 @@ fill_port_var() {  # fill_port_var 变量名 : 填写端口, 回车随机, 冲�
     echo "  ${DIM}$(var_desc "$name")${RESET}"
     [[ -n "$cur" ]] && echo "  ${DIM}当前: ${cur}（直接回车保持不变）${RESET}"
     while true; do
-        rd val "端口（1024-65535；直接回车$([[ -n "$cur" ]] && echo 保持不变 || echo 随机分配)）"
+        rd val "端口（1024-65535；直接回车$([[ -n "$cur" ]] && echo 保持不变 || echo 随机分配)；s 跳过本项；q 退出填写）"
+        case "$val" in
+            [sS]) echo "  已跳过。"; return 1 ;;
+            [qQ]) GF_QUIT=1; echo "  已退出填写。"; return 1 ;;
+        esac
         if [[ -z "$val" ]]; then
             if [[ -n "$cur" ]]; then echo "  保持 ${cur}"; return 0; fi
             val="$(port_random)" || { err "没找到可用的随机端口，请手动输入。"; continue; }
@@ -2231,12 +2235,16 @@ fill_var() {
     echo "  ${DIM}$(var_info "$i")${RESET}"
     [[ "${VS_ST[i]}" == set ]] && skip="回车保持现在的值"
     [[ "${VS_ST[i]}" != set && -n "${VS_DEF[i]}" ]] && skip="回车使用代码默认值"
+    skip="${skip}；q 退出填写"
     while true; do
         case "$kind" in
             token|secret) rds val "请输入（输入不显示；${skip}）" ;;
             ids)          rd val "请输入（多个用空格或逗号分隔；${skip}）" ;;
             *)            rd val "请输入（${skip}）" ;;
         esac
+        if [[ "$val" == [qQ] ]]; then
+            GF_QUIT=1; echo "  已退出填写。"; return 0
+        fi
         if [[ -z "$val" ]]; then
             if [[ "$grp" == req && "${VS_ST[i]}" != set && -z "${VS_DEF[i]}" ]]; then
                 warn "已跳过。这是必填项，不填机器人可能启动失败（之后可在 管理机器人 → 5 里补填）。"
@@ -2308,8 +2316,10 @@ prepare_cfg_files() {
 }
 
 # 自动识别并填写:  guided_fill [all]   (all = 已填的也重新问一遍)
+GF_QUIT=0
 guided_fill() {
     local all="${1:-}" i req=() opt=() adv=() nreq=0 n
+    GF_QUIT=0
     command -v python3 >/dev/null 2>&1 || ensure_python || return 1
     scan_all
     prepare_cfg_files
@@ -2328,18 +2338,22 @@ guided_fill() {
     fi
     echo "  ${DIM}从代码中识别到：必填 ${#req[@]} 项（未填 ${nreq}）、可选 ${#opt[@]} 项、高级 ${#adv[@]} 项（一般不用改）${RESET}"
     for i in "${req[@]}"; do
+        (( GF_QUIT )) && break
         [[ -n "$all" || "${VS_ST[i]}" != set ]] && fill_var "$i"
     done
     local todo=()
     for i in "${opt[@]}"; do [[ -n "$all" || "${VS_ST[i]}" != set ]] && todo+=("$i"); done
-    if (( ${#todo[@]} > 0 )); then
+    if (( ${#todo[@]} > 0 && ! GF_QUIT )); then
         echo
         echo "  ${DIM}可选项（不填也能运行，用到相关功能时再填）：${RESET}"
         for i in "${todo[@]}"; do
             printf '    %s  %s\n' "$(padr "${VS_NAME[i]}" 22)" "${DIM}$(var_info "$i")${RESET}"
         done
         if confirm "现在填写可选项？（每项都可以回车跳过）"; then
-            for i in "${todo[@]}"; do fill_var "$i"; done
+            for i in "${todo[@]}"; do
+                (( GF_QUIT )) && break
+                fill_var "$i"
+            done
         fi
     fi
     n=0
