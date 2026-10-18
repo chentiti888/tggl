@@ -94,6 +94,9 @@ menu_item() {
     printf '  %s%3s%s  %s%s%s  %s\n' "$BOLD$CYAN" "$key" "$RESET" "$TXT" "$(padr "$t" 20)" "$RESET" "${DIM}${3:-}${RESET}"
 }
 
+# 填写过程中输入「返回」(0 或 q) 时置 1, 外层循环据此提前结束
+GF_QUIT=0
+
 # rd 变量名 "提示" [默认值]
 rd() {
     local __v="$1" text="$2" def="${3:-}" __ans
@@ -320,8 +323,10 @@ choose_py() {
         fi
         menu_item $((i + 1)) "${PYFILES[i]}" "$mark"
     done
+    menu_item 0 "返回"
     echo
-    rd sel "请选择编号" "$def"
+    rd sel "请选择编号（0 返回）" "$def"
+    [[ "$sel" == 0 ]] && return 1
     if [[ ! "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#PYFILES[@]} )); then
         err "无效编号：$sel"
         return 1
@@ -844,8 +849,8 @@ write_value() {
 cfg_token() {
     local mode="$1" file="$2" token name
     heading "写入机器人 Token"
-    rds token "请输入机器人 Token（输入不显示）"
-    [[ -n "$token" ]] || { warn "已取消。"; return; }
+    rds token "请输入机器人 Token（输入不显示；0 返回）"
+    [[ -n "$token" && "$token" != 0 ]] || { warn "已取消。"; GF_QUIT=1; return; }
 
     if [[ ! "$token" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{30,}$ ]]; then
         warn "这个 Token 看起来不像标准格式（数字:字符串）。"
@@ -862,8 +867,9 @@ cfg_token() {
         [[ "$mode" == "py" ]] && suggest_vars "$file"
         echo "  ${DIM}没有扫描到明确的变量名，使用默认值${RESET}"
     fi
-    echo "  ${DIM}直接回车使用括号内的名称${RESET}"
+    echo "  ${DIM}直接回车使用括号内的名称；输入 0 返回${RESET}"
     ask name "变量名" "$def"
+    [[ "$name" == 0 ]] && { warn "已取消。"; return; }
     if ! valid_name "$name"; then
         err "变量名不合法，应形如 BOT_TOKEN（只能含字母、数字、下划线，不能以数字开头）。"
         return
@@ -876,7 +882,8 @@ cfg_token() {
 cfg_ids() {
     local mode="$1" file="$2" raw ids id name
     heading "写入管理员 / 用户 ID"
-    rd raw "用户 ID（多个用空格或逗号分隔）"
+    rd raw "用户 ID（多个用空格或逗号分隔；0 返回）"
+    [[ "$raw" == 0 ]] && { warn "已取消。"; GF_QUIT=1; return; }
     ids="$(normalize_ids "$raw")"
     [[ -n "$ids" ]] || { warn "已取消。"; return; }
     for id in $ids; do
@@ -893,8 +900,9 @@ cfg_ids() {
         [[ "$mode" == "py" ]] && suggest_vars "$file"
         echo "  ${DIM}没有扫描到明确的变量名，使用默认值${RESET}"
     fi
-    echo "  ${DIM}直接回车使用括号内的名称${RESET}"
+    echo "  ${DIM}直接回车使用括号内的名称；输入 0 返回${RESET}"
     ask name "变量名" "$def"
+    [[ "$name" == 0 ]] && { warn "已取消。"; return; }
     if ! valid_name "$name"; then
         if [[ "$name" =~ ^[0-9,\ -]+$ ]]; then
             err "这看起来是数字 ID，不是变量名。变量名应形如 ADMIN_IDS。"
@@ -914,8 +922,10 @@ cfg_ids() {
             menu_item 1 "列表" "[111, 222]"
             menu_item 2 "单个数字" "111"
             menu_item 3 "逗号字符串" "'111,222'"
+            menu_item 0 "返回"
             rd f "请选择"
             case "$f" in
+                0|'') warn "已取消。"; return ;;
                 1) fallback="list" ;;
                 2) fallback="int" ;;
                 3) fallback="strjoin" ;;
@@ -1009,10 +1019,10 @@ fill_port_var() {  # fill_port_var 变量名 : 填写端口, 回车随机, 冲�
     echo "  ${DIM}$(var_desc "$name")${RESET}"
     [[ -n "$cur" ]] && echo "  ${DIM}当前: ${cur}（直接回车保持不变）${RESET}"
     while true; do
-        rd val "端口（1024-65535；直接回车$([[ -n "$cur" ]] && echo 保持不变 || echo 随机分配)；s 跳过本项；q 退出填写）"
+        rd val "端口（1024-65535；直接回车$([[ -n "$cur" ]] && echo 保持不变 || echo 随机分配)；s 跳过本项；0 返回）"
         case "$val" in
             [sS]) echo "  已跳过。"; return 1 ;;
-            [qQ]) GF_QUIT=1; echo "  已退出填写。"; return 1 ;;
+            0|[qQ]) GF_QUIT=1; echo "  已返回。"; return 1 ;;
         esac
         if [[ -z "$val" ]]; then
             if [[ -n "$cur" ]]; then echo "  保持 ${cur}"; return 0; fi
@@ -1071,14 +1081,16 @@ fill_env_var() {
     echo "  ${BOLD}${name}${RESET}"
     echo "  ${DIM}${desc}${RESET}"
     if [[ "$name" =~ IDS?$ ]]; then
-        rd val "请输入（多个用空格或逗号分隔；回车跳过）"
+        rd val "请输入（多个用空格或逗号分隔；回车跳过；0 返回）"
+        [[ "$val" == 0 || "$val" == [qQ] ]] && { GF_QUIT=1; echo "  已返回。"; return 0; }
         [[ -n "$val" ]] || { echo "  已跳过。"; return 0; }
         ids="$(normalize_ids "$val")"
         for id in $ids; do [[ "$id" =~ ^-?[0-9]+$ ]] || bad=1; done
         (( bad )) && { err "ID 必须是数字，已跳过。"; return 1; }
         write_value env "$INSTALL_DIR/.env" "$name" ids ids "$ids"
     else
-        rds val "请输入（输入不显示；回车跳过）"
+        rds val "请输入（输入不显示；回车跳过；0 返回）"
+        [[ "$val" == 0 || "$val" == [qQ] ]] && { GF_QUIT=1; echo "  已返回。"; return 0; }
         [[ -n "$val" ]] || { echo "  已跳过。"; return 0; }
         write_value env "$INSTALL_DIR/.env" "$name" str str "$val"
     fi
@@ -1095,6 +1107,7 @@ scan_secret_vars() {
 
 cfg_custom() {
     local mode="$1" file="$2" c i n st
+    GF_QUIT=0
     SECRET_VARS=()
     heading "自定义变量（自动扫描）"
     scan_secret_vars
@@ -1111,12 +1124,20 @@ cfg_custom() {
         printf "  %s  %s  %s\n" "${YELLOW}↵${RESET}" "$(padr "回车" 22)" "${DIM}依次填写所有「未设置」的变量${RESET}"
         menu_item a "全部重新填写"
         menu_item m "手动输入变量名"
+        menu_item 0 "返回"
         echo "  ${DIM}或输入编号只填写某一个${RESET}"
         echo
         rd c "请选择" ""
         case "$c" in
-            "") for n in "${SECRET_VARS[@]}"; do env_is_set "$n" || fill_env_var "$n"; done; return ;;
-            a|A) for n in "${SECRET_VARS[@]}"; do fill_env_var "$n"; done; return ;;
+            0) return ;;
+            "") for n in "${SECRET_VARS[@]}"; do
+                    (( GF_QUIT )) && break
+                    env_is_set "$n" || fill_env_var "$n"
+                done; return ;;
+            a|A) for n in "${SECRET_VARS[@]}"; do
+                    (( GF_QUIT )) && break
+                    fill_env_var "$n"
+                done; return ;;
             m|M) ;;
             *) if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= ${#SECRET_VARS[@]} )); then
                    fill_env_var "${SECRET_VARS[c-1]}"; return
@@ -1128,13 +1149,17 @@ cfg_custom() {
     fi
 
     local name t value
-    rd name "变量名"
+    rd name "变量名（0 返回）"
+    [[ -z "$name" || "$name" == 0 ]] && return
     valid_name "$name" || { err "变量名不合法。"; return; }
     menu_item 1 "字符串" "写成 'xxx'"
     menu_item 2 "数字 / Python 表达式" "原样写入"
+    menu_item 0 "返回"
     rd t "请选择"
+    [[ "$t" == 0 || -z "$t" ]] && return
     [[ "$t" == "1" || "$t" == "2" ]] || { err "无效选择，已取消。"; return; }
-    rd value "请输入值"
+    rd value "请输入值（$([[ "$t" == 1 ]] && echo 0 || echo q) 返回）"
+    if [[ "$value" == [qQ] || ( "$t" == 1 && "$value" == 0 ) ]]; then warn "已取消。"; return; fi
     [[ -n "$value" ]] || { warn "已取消。"; return; }
     if [[ "$t" == "2" ]]; then
         write_value "$mode" "$file" "$name" raw raw "$value"
@@ -1155,10 +1180,12 @@ do_config_manual() {
     heading "写入位置"
     menu_item 1 "写入 py 脚本变量" "直接改代码，如 BOT_TOKEN = '...'"
     menu_item 2 "写入 .env 文件（推荐）" "代码需用 os.environ 读取"
+    menu_item 0 "返回"
     echo
     local m mode file
     rd m "请选择"
     case "$m" in
+        0|'') return 0 ;;
         1)
             mode="py"
             choose_py "请选择要写入的 py 脚本" || return 1
@@ -1447,8 +1474,11 @@ quick_keys_legacy() {
         mode="py"; file="$INSTALL_DIR/$MAIN_PY"
         echo "  ${DIM}代码里没有读取环境变量，将直接写入 ${MAIN_PY} 里的变量${RESET}"
     fi
+    GF_QUIT=0
     cfg_token "$mode" "$file"
+    (( GF_QUIT )) && return 0
     cfg_ids "$mode" "$file"
+    (( GF_QUIT )) && return 0
 
     # 代码里还有其他 API 密钥时，提示是否现在填写
     local extra=() ports=() n
@@ -1461,13 +1491,19 @@ quick_keys_legacy() {
     if [[ "$mode" == "env" ]] && (( ${#ports[@]} > 0 )); then
         echo
         echo "  ${DIM}代码需要监听端口：${ports[*]}（同一台服务器上的机器人不能用同一个端口）${RESET}"
-        for n in "${ports[@]}"; do fill_port_var "$n"; done
+        for n in "${ports[@]}"; do
+            fill_port_var "$n"
+            (( GF_QUIT )) && return 0
+        done
     fi
     if [[ "$mode" == "env" ]] && (( ${#extra[@]} > 0 )); then
         echo
         echo "  ${DIM}代码里还支持这些可选 API 密钥：${extra[*]}${RESET}"
         if confirm "现在填写？（每项可回车跳过；之后也可在 管理机器人 → 5 里填）"; then
-            for n in "${extra[@]}"; do fill_env_var "$n"; done
+            for n in "${extra[@]}"; do
+                fill_env_var "$n"
+                (( GF_QUIT )) && return 0
+            done
         fi
     fi
 }
@@ -2235,15 +2271,17 @@ fill_var() {
     echo "  ${DIM}$(var_info "$i")${RESET}"
     [[ "${VS_ST[i]}" == set ]] && skip="回车保持现在的值"
     [[ "${VS_ST[i]}" != set && -n "${VS_DEF[i]}" ]] && skip="回车使用代码默认值"
-    skip="${skip}；q 退出填写"
+    local back=q
+    case "$kind" in token|secret|ids) back=0 ;; esac
+    skip="${skip}；${back} 返回"
     while true; do
         case "$kind" in
             token|secret) rds val "请输入（输入不显示；${skip}）" ;;
             ids)          rd val "请输入（多个用空格或逗号分隔；${skip}）" ;;
             *)            rd val "请输入（${skip}）" ;;
         esac
-        if [[ "$val" == [qQ] ]]; then
-            GF_QUIT=1; echo "  已退出填写。"; return 0
+        if [[ "$val" == [qQ] || ( "$back" == 0 && "$val" == 0 ) ]]; then
+            GF_QUIT=1; echo "  已返回。"; return 0
         fi
         if [[ -z "$val" ]]; then
             if [[ "$grp" == req && "${VS_ST[i]}" != set && -z "${VS_DEF[i]}" ]]; then
@@ -2316,7 +2354,6 @@ prepare_cfg_files() {
 }
 
 # 自动识别并填写:  guided_fill [all]   (all = 已填的也重新问一遍)
-GF_QUIT=0
 guided_fill() {
     local all="${1:-}" i req=() opt=() adv=() nreq=0 n
     GF_QUIT=0
@@ -2476,7 +2513,8 @@ add_bot() {
         [[ -z "$url" || "$url" == 0 ]] && return 9
         break
     done
-    rd branch "分支（留空=默认分支）"
+    rd branch "分支（留空=默认分支；0 返回）"
+    [[ "$branch" == 0 ]] && return 9
 
     heading "请确认"
     echo "  $(lab 名称)$name"
@@ -2533,11 +2571,12 @@ pick_bot() {
                  printf '%s  %s' "$(svc_state "${SERVICE_NAME:-${BOTS[i]}}")" "${DIM}${INSTALL_DIR}${RESET}" )"
         printf '  %s%3s%s  %s  %s\n' "$BOLD$CYAN" "$((i + 1))" "$RESET" "${TXT}$(padr "${BOTS[i]}" 16)${RESET}" "$info"
     done
+    menu_item 0 "返回"
     echo
     local def=""
     (( ${#BOTS[@]} == 1 )) && def="1"
-    rd sel "请选择编号（直接回车取消）" "$def"
-    [[ -n "$sel" ]] || return 1
+    rd sel "请选择编号（0 或回车返回）" "$def"
+    [[ -z "$sel" || "$sel" == 0 ]] && return 9
     if [[ ! "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#BOTS[@]} )); then
         err "无效选择：$sel"
         return 1
@@ -2813,7 +2852,8 @@ while true; do
     case "$CHOICE" in
         1) menu_create_dir ;;
         2) add_bot; (( $? == 9 )) || pause ;;
-        3) if pick_bot; then bot_menu; else pause; fi ;;
+        3) pick_bot; rc=$?
+           if (( rc == 0 )); then bot_menu; elif (( rc != 9 )); then pause; fi ;;
         0|q|Q) [[ -n ${TGBOT_FROM_WSM:-} ]] || { echo; echo "  已退出。"; }; exit 0 ;;
         *) warn "无效选择：$CHOICE"; sleep 1 ;;
     esac
