@@ -1116,12 +1116,16 @@ def new_job(ctx, kind, title):
     now = time.time()
     for jid in [k for k, j in JOBS.items() if now - j["created"] > JOB_KEEP]:
         JOBS.pop(jid, None)
-    running = sum(1 for j in JOBS.values() if j["uid"] == ctx["uid"] and not j["done"])
-    if running >= JOB_PER_USER:
+    mine = [j for j in JOBS.values() if j["uid"] == ctx["uid"] and not j["done"]]
+    # 同类任务同一时间只允许跑一个：切页面回来再点“开始”也发不出第二个，不会把机器拖卡
+    if any(j["kind"] == kind for j in mine):
+        raise ApiError("这个功能还有任务在运行，请等它完成或先取消")
+    if len(mine) >= JOB_PER_USER:
         raise ApiError("你有任务还在运行，请等它完成或先取消")
     jid = secrets.token_urlsafe(9)
     JOBS[jid] = {"id": jid, "uid": ctx["uid"], "kind": kind, "title": title, "created": now,
-                 "done": False, "cancel": False, "error": None, "result": None, "progress": {}}
+                 "done": False, "cancel": False, "error": None, "result": None, "progress": {},
+                 "seen": False}
     return JOBS[jid]
 
 
@@ -1406,9 +1410,21 @@ def _job_of(ctx, p):
     return job
 
 
+@action("job_active")
+async def a_job_active(ctx, p):
+    """切换页面再回来时，前端靠它找回任务：还在跑的，或已跑完但结果还没被看过的。"""
+    jobs = [j for j in JOBS.values()
+            if j["uid"] == ctx["uid"] and (not j["done"] or not j.get("seen"))]
+    jobs.sort(key=lambda j: j["created"])
+    return {"jobs": [{"id": j["id"], "kind": j["kind"], "title": j["title"], "done": j["done"]}
+                     for j in jobs]}
+
+
 @action("job_get")
 async def a_job_get(ctx, p):
     job = _job_of(ctx, p)
+    if job["done"]:
+        job["seen"] = True        # 结果已经交给前端显示过了，之后不再自动接回
     return {"id": job["id"], "kind": job["kind"], "title": job["title"], "done": job["done"],
             "error": job["error"], "progress": job["progress"], "result": job["result"],
             "elapsed": round((job.get("finished") or time.time()) - job["created"], 1)}
