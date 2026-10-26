@@ -1,0 +1,7 @@
+# 机器人本体
+python-telegram-bot>=21.0
+Pillow>=10.0
+# 小程序：SFTP 文件管理 / SSH 功能
+paramiko>=3.0
+# 网页推送（可选：装了更快，没装会用 webpush.py 里自带的纯 Python 实现）
+cryptography>=41.0

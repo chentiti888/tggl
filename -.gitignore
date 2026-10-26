@@ -1,0 +1,12 @@
+# 运行数据 / 密钥，不进仓库
+.env
+__pycache__/
+*.jsonl
+cf_*.json
+cos_packs.json
+nav_*.json
+nav_*.jpg
+nav_icons/
+nav_px_sign.key
+china_provinces.json
+ip2region_v4.xdb
