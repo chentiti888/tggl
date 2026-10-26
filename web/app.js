@@ -3489,7 +3489,11 @@
       var n = Object.keys(picked).length;
       clear(delBar);
       if (selMode) {
-        delBar.appendChild(el('span', { text: n ? '已选 ' + n + ' 项' : '点选要删除的文件或文件夹' }));
+        delBar.appendChild(el('span', { text: n ? '已选 ' + n + ' 项' : '点选文件或文件夹' }));
+        var one = n === 1 ? picked[Object.keys(picked)[0]] : null;
+        delBar.appendChild(el('button', { class: 'btn sm', text: '重命名', disabled: one && one.type !== 'submodule' ? null : true, onclick: function () {
+          ghRename(repo, one.path, one.type === 'dir', function () { selMode = false; picked = {}; selBtn.textContent = '选择'; selBtn.classList.remove('primary'); go(cur.tab, cur.sub, true); });
+        } }));
         var del = el('button', { class: 'btn sm danger', text: '删除', disabled: n ? null : true });
         del.addEventListener('click', function () {
           var ps = Object.keys(picked), dirs = ps.filter(function (p) { return picked[p].type === 'dir'; }).length;
@@ -3510,6 +3514,21 @@
         el('span', { class: 'sp' }),
         el('button', { class: 'btn sm danger', text: '删除仓库', onclick: function () { ghDelRepo(repo); } })));
     }).catch(function (e) { clear(card).appendChild(failBox(e.message, function () { go(cur.tab, cur.sub, true); })); });
+  }
+  // 重命名 / 移动：写新的完整路径；改中间的文件夹名就是移动，文件夹不存在会自动建
+  function ghRename(repo, path, isDir, done) {
+    sheet(isDir ? '重命名文件夹' : '重命名文件', [
+      { key: 'p', label: '新路径（可以只改名字，也可以改前面的文件夹把它移过去；文件夹不存在会自动建）', value: path },
+      { key: 'msg', label: '提交说明（可选）', ph: '重命名 ' + path.split('/').pop() }
+    ], '确定', function (v) {
+      var np = (v.p || '').trim().replace(/^\/+|\/+$/g, '').replace(/\/{2,}/g, '/');
+      if (!np) return Promise.reject(new Error('新路径不能为空'));
+      if (np === path) return Promise.reject(new Error('新名字和原来一样'));
+      return api('gh_mv', { repo: repo, src: path, dst: np, msg: v.msg }).then(function (r) {
+        toast(r.n > 1 ? '已移动 ' + r.n + ' 个文件' : '已重命名');
+        if (done) done(r.path);
+      });
+    });
   }
   function ghDelRepo(repo) {
     var name = repo.split('/')[1];
@@ -3647,6 +3666,9 @@
       if (f.text != null) acts.appendChild(el('button', { class: 'btn', text: '复制内容', onclick: function () { copy(f.text); } }));
       acts.appendChild(el('button', { class: 'btn', text: '替换', onclick: function () { ghPickUpload(repo, dirPath, [], name, function () { go(cur.tab, cur.sub, true); }); } }));
       acts.appendChild(el('button', { class: 'btn', text: '记录', onclick: function () { go(gTab(), 'gitc:' + repo + '|' + path); } }));
+      acts.appendChild(el('button', { class: 'btn', text: '重命名', onclick: function () {
+        ghRename(repo, path, false, function (np) { go(gTab(), 'gitf:' + repo + '|' + np, true); });
+      } }));
       acts.appendChild(el('button', { class: 'btn danger', text: '删除', onclick: function () {
         confirmBox('删除文件', '删除「' + name + '」？会作为一次提交记录在仓库里。', function () {
           return api('gh_del', { repo: repo, paths: [path] }).then(function () { toast('已删除'); backHandler(); });
