@@ -3347,7 +3347,7 @@ GH_UPLOADS = {}                   # 上传 id → 状态（提交进度 / 结果
 GH_USER = {"t": 0, "tok": "", "d": None}
 
 OWNER_ONLY.update({"gh", "gh_token", "gh_repos", "gh_repo", "gh_repo_new", "gh_repo_del", "gh_dir", "gh_file",
-                   "gh_commits", "gh_commit", "gh_zip", "gh_zip_chunk", "gh_up_begin", "gh_up_chunk", "gh_up_commit", "gh_up_state", "gh_del"})
+                   "gh_commits", "gh_commit", "gh_zip", "gh_zip_chunk", "gh_up_begin", "gh_up_chunk", "gh_up_commit", "gh_up_state", "gh_del", "gh_mv"})
 
 
 class GhNotFound(ApiError):
@@ -3973,6 +3973,54 @@ async def a_gh_del(ctx, p):
     msg = str(p.get("msg") or "").strip()[:500] or ("删除 " + paths[0] if len(paths) == 1 else f"删除 {len(paths)} 项")
     r = await asyncio.to_thread(_gh_del_sync, repo, paths, msg)
     print("GitHub 删除文件：", repo, r["n"], "个", r["sha"][:7])
+    return r
+
+
+def _gh_mv_sync(repo, src, dst, msg):
+    """重命名 / 移动文件或文件夹：一次提交里“在新位置加上 + 删掉旧位置”，文件内容不重新上传（直接复用原来的 blob）。"""
+    info, _h = _gh_call_sync("GET", "/repos/" + repo)
+    branch = info.get("default_branch") or "main"
+    ref, _h = _gh_call_sync("GET", f"/repos/{repo}/git/ref/heads/{_gh_q(branch)}")
+    base = ref["object"]["sha"]
+    commit, _h = _gh_call_sync("GET", f"/repos/{repo}/git/commits/{base}")
+    full, _h = _gh_call_sync("GET", f"/repos/{repo}/git/trees/{commit['tree']['sha']}", query={"recursive": "1"})
+    if full.get("truncated"):
+        raise ApiError("仓库文件太多，没法在这里重命名，请到 GitHub 网站上操作")
+    ents = [x for x in full.get("tree") or [] if x.get("type") in ("blob", "commit")]
+    moving = [x for x in ents if x["path"] == src or x["path"].startswith(src + "/")]
+    if not moving:
+        raise ApiError("没有找到这个文件 / 文件夹")
+    if any(x["type"] == "commit" for x in moving):
+        raise ApiError("里面有子模块，不能在这里移动")
+    parts = dst.split("/")
+    for x in ents:
+        if x["path"] == dst or x["path"].startswith(dst + "/"):
+            raise ApiError("新位置已经有同名的文件或文件夹：" + dst)
+        if any(x["path"] == "/".join(parts[:i]) for i in range(1, len(parts))):
+            raise ApiError("「" + x["path"] + "」是一个文件，不能当文件夹用")
+    tree = []
+    for x in moving:
+        tree.append({"path": dst + x["path"][len(src):], "mode": x["mode"], "type": "blob", "sha": x["sha"]})
+        tree.append({"path": x["path"], "mode": x["mode"], "type": "blob", "sha": None})
+    t, _h = _gh_call_sync("POST", f"/repos/{repo}/git/trees", {"base_tree": commit["tree"]["sha"], "tree": tree})
+    c, _h = _gh_call_sync("POST", f"/repos/{repo}/git/commits", {"message": msg, "tree": t["sha"], "parents": [base]})
+    _gh_call_sync("PATCH", f"/repos/{repo}/git/refs/heads/{_gh_q(branch)}", {"sha": c["sha"]})
+    return {"sha": c["sha"], "n": len(moving), "path": dst}
+
+
+@action("gh_mv", admin=True)
+async def a_gh_mv(ctx, p):
+    repo = _gh_repo(p.get("repo"))
+    src, dst = _gh_path(p.get("src"), False), _gh_path(p.get("dst"), False)
+    if src == dst:
+        raise ApiError("新名字和原来一样")
+    if dst.startswith(src + "/"):
+        raise ApiError("不能把文件夹移到它自己里面")
+    if any(len(seg) > 255 for seg in dst.split("/")):
+        raise ApiError("名字太长了")
+    msg = str(p.get("msg") or "").strip()[:500] or f"重命名 {src} → {dst}"
+    r = await asyncio.to_thread(_gh_mv_sync, repo, src, dst, msg)
+    print("GitHub 重命名：", repo, src, "→", dst, r["n"], "个", r["sha"][:7])
     return r
 
 
