@@ -3,22 +3,26 @@
 #
 # 安装（在节点服务器上用 root 执行；命令由操作台「工具 → 安装代理 → 添加节点」生成）：
 #   curl -fsSL 'https://你的网址/px.php?a=sh' | bash -s -- https://你的网址 节点密钥
-# 卸载 agent（不会卸载已装好的 hy2 / anytls）：
+# 卸载 agent（不会卸载已装好的 hy2 / anytls / tuic / reality）：
 #   bash /opt/px-agent/px.sh uninstall
 #
 # agent 定时向 https://你的网址/px.php 报到并领取任务（短连接），只向外发请求，不监听任何端口。
-# 服务器下发的任务只有固定几种（安装 / 卸载 hy2、anytls，重启，更新），参数都会再校验一遍。
+# 服务器下发的任务只有固定几种（安装 / 卸载 hy2、anytls、tuic、reality，重启，更新），参数都会再校验一遍。
 # 更新 agent 时新脚本必须通过签名校验（公钥在下面 PX_PUB，安装时由机器人填入），否则拒绝替换。
 
-AGENT_VER=5
+AGENT_VER=8
 PX_PUB=""
 DIR=/opt/px-agent
 SVC=px-agent
 HY_DIR=/etc/hysteria
 HY_SVC=hysteria-server.service
 AT_DIR=/etc/anytls
-AT_BIN=/usr/local/bin/sing-box-anytls
+AT_BIN=/usr/local/bin/sing-box-anytls     # anytls 和 tuic 共用这一个 sing-box（文件名沿用旧版，已装的节点不用动）
 AT_SVC=anytls-server.service
+TU_DIR=/etc/tuic
+TU_SVC=tuic-server.service
+RE_DIR=/etc/reality                       # VLESS + Reality：同样用共用的 sing-box，不需要证书
+RE_SVC=reality-server.service
 HOP_SVC=px-hop.service
 INTERVAL=10              # 默认 10 秒拉一次；以服务器下发的 NEXT 为准（有人在看 / 有任务时 3 秒）
 
@@ -86,7 +90,7 @@ get_cert() {
     fi
     mkdir -p "$dir"
     "$acme" --install-cert -d "$dom" --ecc --fullchain-file "$dir/fullchain.pem" --key-file "$dir/key.pem" \
-        --reloadcmd "systemctl restart hysteria-server.service >/dev/null 2>&1; systemctl restart anytls-server.service >/dev/null 2>&1; true" >/dev/null 2>&1 \
+        --reloadcmd "for s in hysteria-server anytls-server tuic-server; do systemctl is-enabled --quiet \$s.service 2>/dev/null && systemctl restart \$s.service >/dev/null 2>&1; done; true" >/dev/null 2>&1 \
         || { echo "安装证书失败"; return 1; }
     chmod 755 "$CERT_DIR" "$dir"; chmod 644 "$dir/fullchain.pem"
     if id hysteria >/dev/null 2>&1; then chgrp hysteria "$dir/key.pem"; chmod 640 "$dir/key.pem"; else chmod 600 "$dir/key.pem"; fi
@@ -207,33 +211,75 @@ at_arch() { case "$(uname -m)" in x86_64|amd64) echo amd64;; aarch64|arm64) echo
 
 at_bin_ok() { [ -x "$AT_BIN" ] && "$AT_BIN" version 2>/dev/null | head -n1 | grep -qE 'version 1\.(1[2-9]|[2-9][0-9])|version [2-9]\.'; }
 
+AT_FALLBACK_VER=1.12.0     # GitHub 的接口和跳转都查不到最新版本时用这个
+
 at_install_bin() {
-    local arch ver tmp url bin
+    local arch ver tmp url bin rel name want="" got html
     arch=$(at_arch); [ -n "$arch" ] || { echo "不支持的架构：$(uname -m)"; return 1; }
-    local rel name want got
-    rel=$(curl -fsSL --connect-timeout 8 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null)
+    # 1) 先问 GitHub 接口（带每个文件的 SHA256）；2) 接口连不上 / 被限流，就从 github.com 的“最新发布”跳转里取版本号
+    rel=$(curl -fsSL --connect-timeout 8 -m 20 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null)
     ver=$(echo "$rel" | grep -m1 '"tag_name"' | sed -E 's/.*"v?([0-9][^"]*)".*/\1/')
-    echo "$ver" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "查不到 sing-box 最新版本（节点连不上 api.github.com？）"; return 1; }
+    if ! echo "$ver" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        rel=""
+        ver=$(curl -fsSI --connect-timeout 8 -m 20 https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | tr -d '\r' | grep -i '^location:' | sed -E 's#.*/tag/v([0-9]+\.[0-9]+\.[0-9]+).*#\1#' | head -n1)
+    fi
+    if ! echo "$ver" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        ver=$AT_FALLBACK_VER; echo "查不到 sing-box 最新版本（节点连不上 api.github.com / github.com？），改用内置版本 v$ver"
+    fi
     name="sing-box-${ver}-linux-${arch}.tar.gz"
-    # GitHub 给每个发布文件算的 SHA256（"digest":"sha256:..."），用来校验下载内容
-    want=$(echo "$rel" | tr ',{}' '\n\n\n' | awk -v n="\"name\":\"$name\"" '
-        { gsub(/^[ \t]+/, ""); gsub(/": "/, "\":\"") }
-        $0 == n { f = 1; next }
-        f && /^"browser_download_url":/ { f = 0 }
-        f && /^"digest":"sha256:/ { sub(/^"digest":"sha256:/, ""); sub(/".*/, ""); print; exit }')
-    echo "$want" | grep -qE '^[0-9a-f]{64}$' || { echo "GitHub 没给出 $name 的校验值，为安全起见不安装"; return 1; }
+    # 官方校验值：接口里有 "digest":"sha256:..."；没有就从发布页的文件列表里找
+    if [ -n "$rel" ]; then
+        want=$(echo "$rel" | tr ',{}' '\n\n\n' | awk -v n="\"name\":\"$name\"" '
+            { gsub(/^[ \t]+/, ""); gsub(/": "/, "\":\"") }
+            $0 == n { f = 1; next }
+            f && /^"browser_download_url":/ { f = 0 }
+            f && /^"digest":"sha256:/ { sub(/^"digest":"sha256:/, ""); sub(/".*/, ""); print; exit }')
+    fi
+    if ! echo "$want" | grep -qE '^[0-9a-f]{64}$'; then
+        html=$(curl -fsSL --connect-timeout 8 -m 20 "https://github.com/SagerNet/sing-box/releases/expanded_assets/v${ver}" 2>/dev/null)
+        want=$(echo "$html" | tr '<>' '\n\n' | awk -v n="$name" '
+            $0 == n { f = 1; c = 0; next }
+            f { c++; if (match($0, /sha256:[0-9a-f]{64}/)) { print substr($0, RSTART + 7, 64); exit } if (c > 40) exit }')
+    fi
     tmp=$(mktemp -d)
     url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${name}"
     echo "下载 sing-box v$ver ($arch)..."
     curl -fL --retry 3 --connect-timeout 15 -s -o "$tmp/sb.tgz" "$url" || { echo "下载失败（节点连不上 github？）"; rm -rf "$tmp"; return 1; }
-    got=$(sha256sum "$tmp/sb.tgz" | cut -d' ' -f1)
-    [ "$got" = "$want" ] || { echo "sing-box 校验失败（下载内容和官方不一致），不安装"; rm -rf "$tmp"; return 1; }
-    echo "SHA256 校验通过"
+    if echo "$want" | grep -qE '^[0-9a-f]{64}$'; then
+        got=$(sha256sum "$tmp/sb.tgz" | cut -d' ' -f1)
+        [ "$got" = "$want" ] || { echo "sing-box 校验失败（下载内容和官方不一致），不安装"; rm -rf "$tmp"; return 1; }
+        echo "SHA256 校验通过"
+    else
+        echo "⚠ 没拿到官方校验值，这次下载没有做 SHA256 校验（地址是 GitHub 官方发布，走 HTTPS）"
+    fi
     tar -xzf "$tmp/sb.tgz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
     bin=$(find "$tmp" -type f -name sing-box | head -n1)
     [ -n "$bin" ] || { echo "安装包里没有 sing-box"; rm -rf "$tmp"; return 1; }
     install -m 755 "$bin" "$AT_BIN"; rm -rf "$tmp"
     at_bin_ok || { echo "sing-box 版本过低（anytls 需要 >= 1.12.0）"; return 1; }
+}
+
+sb_unit() {                # sb_unit 服务名 说明 配置文件：用共用的 sing-box 跑一个服务
+    cat > "/etc/systemd/system/$1" <<EOF
+[Unit]
+Description=$2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$AT_BIN run -c $3
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+sb_bin_rm() {              # anytls / tuic / reality 都卸载了才删共用的 sing-box
+    [ -f "/etc/systemd/system/$AT_SVC" ] || [ -f "/etc/systemd/system/$TU_SVC" ] || [ -f "/etc/systemd/system/$RE_SVC" ] || rm -f "$AT_BIN"
 }
 
 job_anytls() {             # 需要 PORT PASS SNI
@@ -257,22 +303,7 @@ EOF
     local out
     if ! out=$("$AT_BIN" check -c "$AT_DIR/config.new.json" 2>&1); then rm -f "$AT_DIR/config.new.json"; echo "配置校验失败：$out"; return 1; fi
     mv -f "$AT_DIR/config.new.json" "$AT_DIR/config.json"; chmod 600 "$AT_DIR/config.json"
-    cat > /etc/systemd/system/$AT_SVC <<EOF
-[Unit]
-Description=AnyTLS Server (sing-box)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$AT_BIN run -c $AT_DIR/config.json
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    sb_unit "$AT_SVC" "AnyTLS Server (sing-box)" "$AT_DIR/config.json"
     fw_open "$PORT" tcp
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable "$AT_SVC" >/dev/null 2>&1
@@ -285,25 +316,129 @@ EOF
 
 job_rm_anytls() {
     systemctl disable --now "$AT_SVC" >/dev/null 2>&1
-    rm -f /etc/systemd/system/$AT_SVC "$AT_BIN"; rm -rf "$AT_DIR"
+    rm -f /etc/systemd/system/$AT_SVC; rm -rf "$AT_DIR"
+    sb_bin_rm
     systemctl daemon-reload >/dev/null 2>&1
     echo "AnyTLS 已卸载"
 }
 
+# ---------------------------------------------------------------- VLESS + Reality（和 anytls / tuic 共用同一个 sing-box）
+# 不需要域名和证书：借一个真实网站（SNI）的 TLS 握手伪装。私钥只留在节点上，公钥回报给小程序生成链接。
+job_reality() {            # 需要 PORT UUID SID SNI
+    pkg_install curl; pkg_install tar
+    at_bin_ok || at_install_bin || return 1
+    mkdir -p "$RE_DIR"; chmod 700 "$RE_DIR"
+    # 伪装网站必须从这台节点能连上、并支持 TLS 1.3，否则客户端握手会失败
+    if ! curl -sS -o /dev/null --connect-timeout 8 -m 15 --tlsv1.3 "https://$SNI/" 2>"$RE_DIR/probe.err"; then
+        echo "节点连不上伪装网站 $SNI（要能用 TLS 1.3 访问 https://$SNI/）：$(tail -n1 "$RE_DIR/probe.err")"; rm -f "$RE_DIR/probe.err"; return 1
+    fi
+    rm -f "$RE_DIR/probe.err"
+    local priv pub kp
+    if [ -s "$RE_DIR/keys" ]; then
+        priv=$(sed -n 's/^PrivateKey: *//p' "$RE_DIR/keys" | head -n1); pub=$(sed -n 's/^PublicKey: *//p' "$RE_DIR/keys" | head -n1)
+    fi
+    if ! [[ "$priv" =~ ^[A-Za-z0-9_-]{43}$ && "$pub" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+        kp=$("$AT_BIN" generate reality-keypair 2>&1) || { echo "生成 Reality 密钥失败：$kp"; return 1; }
+        priv=$(echo "$kp" | sed -n 's/^PrivateKey: *//p' | head -n1); pub=$(echo "$kp" | sed -n 's/^PublicKey: *//p' | head -n1)
+        [[ "$priv" =~ ^[A-Za-z0-9_-]{43}$ && "$pub" =~ ^[A-Za-z0-9_-]{43}$ ]] || { echo "没有读到 Reality 密钥：$kp"; return 1; }
+        ( umask 077; printf 'PrivateKey: %s\nPublicKey: %s\n' "$priv" "$pub" > "$RE_DIR/keys" )
+    fi
+    cat > "$RE_DIR/config.new.json" <<EOF
+{
+  "log": {"level": "warn", "timestamp": true},
+  "inbounds": [{
+    "type": "vless", "tag": "vless-in", "listen": "::", "listen_port": $PORT,
+    "users": [{"name": "user", "uuid": "$UUID", "flow": "xtls-rprx-vision"}],
+    "tls": {"enabled": true, "server_name": "$SNI",
+      "reality": {"enabled": true, "handshake": {"server": "$SNI", "server_port": 443}, "private_key": "$priv", "short_id": ["$SID"]}}
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}]
+}
+EOF
+    local out
+    if ! out=$("$AT_BIN" check -c "$RE_DIR/config.new.json" 2>&1); then rm -f "$RE_DIR/config.new.json"; echo "配置校验失败：$out"; return 1; fi
+    mv -f "$RE_DIR/config.new.json" "$RE_DIR/config.json"; chmod 600 "$RE_DIR/config.json"
+    sb_unit "$RE_SVC" "VLESS Reality Server (sing-box)" "$RE_DIR/config.json"
+    fw_open "$PORT" tcp
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable "$RE_SVC" >/dev/null 2>&1
+    systemctl restart "$RE_SVC"
+    sleep 2
+    if ! systemctl is-active --quiet "$RE_SVC"; then echo "VLESS Reality 启动失败，日志："; journalctl -u "$RE_SVC" -n 15 --no-pager 2>&1 | tail -n 15; return 1; fi
+    PBK="$pub"
+    echo "VLESS Reality 已运行：TCP $PORT · 伪装 $SNI"
+}
+
+job_rm_reality() {
+    systemctl disable --now "$RE_SVC" >/dev/null 2>&1
+    rm -f /etc/systemd/system/$RE_SVC; rm -rf "$RE_DIR"
+    sb_bin_rm
+    systemctl daemon-reload >/dev/null 2>&1
+    echo "VLESS Reality 已卸载"
+}
+
+# ---------------------------------------------------------------- tuic v5（和 anytls 共用同一个 sing-box）
+job_tuic() {               # 需要 PORT UUID PASS SNI
+    pkg_install curl; pkg_install openssl; pkg_install tar
+    at_bin_ok || at_install_bin || return 1
+    mkdir -p "$TU_DIR"; chmod 700 "$TU_DIR"
+    local crt="$TU_DIR/server.crt" key="$TU_DIR/server.key"
+    if [ -n "$DOMAIN" ]; then get_cert "$DOMAIN" || return 1; crt="$CERT_CRT"; key="$CERT_KEY"
+    else mkcert "$TU_DIR" "$SNI" || return 1; fi
+    cat > "$TU_DIR/config.new.json" <<EOF
+{
+  "log": {"level": "warn", "timestamp": true},
+  "inbounds": [{
+    "type": "tuic", "tag": "tuic-in", "listen": "::", "listen_port": $PORT,
+    "users": [{"name": "user", "uuid": "$UUID", "password": "$PASS"}],
+    "congestion_control": "bbr", "auth_timeout": "3s", "zero_rtt_handshake": false, "heartbeat": "10s",
+    "tls": {"enabled": true, "server_name": "$SNI", "alpn": ["h3"], "certificate_path": "$crt", "key_path": "$key"}
+  }],
+  "outbounds": [{"type": "direct", "tag": "direct"}]
+}
+EOF
+    local out
+    if ! out=$("$AT_BIN" check -c "$TU_DIR/config.new.json" 2>&1); then rm -f "$TU_DIR/config.new.json"; echo "配置校验失败：$out"; return 1; fi
+    mv -f "$TU_DIR/config.new.json" "$TU_DIR/config.json"; chmod 600 "$TU_DIR/config.json"
+    sb_unit "$TU_SVC" "TUIC Server (sing-box)" "$TU_DIR/config.json"
+    fw_open "$PORT" udp
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable "$TU_SVC" >/dev/null 2>&1
+    systemctl restart "$TU_SVC"
+    sleep 2
+    if ! systemctl is-active --quiet "$TU_SVC"; then echo "TUIC 启动失败，日志："; journalctl -u "$TU_SVC" -n 15 --no-pager 2>&1 | tail -n 15; return 1; fi
+    echo "TUIC 已运行：UDP $PORT · bbr${DOMAIN:+ · 域名证书 $DOMAIN}"
+}
+
+job_rm_tuic() {
+    systemctl disable --now "$TU_SVC" >/dev/null 2>&1
+    rm -f /etc/systemd/system/$TU_SVC; rm -rf "$TU_DIR"
+    sb_bin_rm
+    systemctl daemon-reload >/dev/null 2>&1
+    echo "TUIC 已卸载"
+}
+
 # ---------------------------------------------------------------- 任务分发（先校验再执行）
-OP=""; JID=""; PORT=""; PASS=""; OBFS=""; SNI=""; HOP=""; FP=""; DOMAIN=""
+OP=""; JID=""; PORT=""; PASS=""; OBFS=""; SNI=""; HOP=""; FP=""; DOMAIN=""; UUID=""; SID=""; PBK=""
 
 valid_job() {
     [[ "$JID" =~ ^[A-Za-z0-9]{6,16}$ ]] || return 1
     case "$OP" in
-        update|restart_hy2|restart_anytls|uninstall_agent|rm_hy2|rm_anytls) return 0 ;;
-        hy2|anytls)
+        update|restart_hy2|restart_anytls|restart_tuic|restart_reality|uninstall_agent|rm_hy2|rm_anytls|rm_tuic|rm_reality) return 0 ;;
+        reality)
+            [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || return 1
+            [[ "$SNI" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,98}[A-Za-z0-9])?$ ]] && [[ "$SNI" == *.* ]] || return 1
+            [[ "$UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+            [[ "$SID" =~ ^[0-9a-f]{8}$ ]] || return 1
+            return 0 ;;
+        hy2|anytls|tuic)
             [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || return 1
             [[ "$PASS" =~ ^[A-Za-z0-9]{8,64}$ ]] || return 1
             [[ "$SNI" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,98}[A-Za-z0-9])?$ ]] || return 1
             [ -z "$OBFS" ] || [[ "$OBFS" =~ ^[A-Za-z0-9]{8,64}$ ]] || return 1
             [ -z "$HOP" ] || [[ "$HOP" =~ ^[0-9]{1,5}-[0-9]{1,5}$ ]] || return 1
             [ -z "$DOMAIN" ] || { [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,98}[A-Za-z0-9])?$ ]] && [[ "$DOMAIN" == *.* ]]; } || return 1
+            [ "$OP" != tuic ] || [[ "$UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
             return 0 ;;
     esac
     return 1
@@ -334,30 +469,37 @@ self_update() {
 
 run_job() {
     local rc=0
-    RESTART_AGENT=0; FP=""
+    RESTART_AGENT=0; FP=""; PBK=""
     {
         case "$OP" in
             hy2) job_hy2 ;;
             anytls) job_anytls ;;
+            tuic) job_tuic ;;
+            reality) job_reality ;;
             rm_hy2) job_rm_hy2 ;;
             rm_anytls) job_rm_anytls ;;
+            rm_tuic) job_rm_tuic ;;
+            rm_reality) job_rm_reality ;;
             restart_hy2) systemctl restart "$HY_SVC" && echo "已重启 hy2" ;;
             restart_anytls) systemctl restart "$AT_SVC" && echo "已重启 anytls" ;;
+            restart_tuic) systemctl restart "$TU_SVC" && echo "已重启 tuic" ;;
+            restart_reality) systemctl restart "$RE_SVC" && echo "已重启 reality" ;;
             update) self_update ;;
-            uninstall_agent) echo "agent 即将卸载（hy2 / anytls 不受影响）"; UNINSTALL=1 ;;
+            uninstall_agent) echo "agent 即将卸载（hy2 / anytls / tuic / reality 不受影响）"; UNINSTALL=1 ;;
         esac
     } > "$DIR/job.log" 2>&1
     rc=$?
     [ "$rc" = 0 ] || true
     if [ -z "$DOMAIN" ] && [ "$OP" = hy2 ] && [ "$rc" = 0 ]; then FP=$(cert_fp "$HY_DIR/server.crt"); fi
     if [ -z "$DOMAIN" ] && [ "$OP" = anytls ] && [ "$rc" = 0 ]; then FP=$(cert_fp "$AT_DIR/server.crt"); fi
-    { printf 'JOB=%s\nRC=%s\nFP=%s\n' "$JID" "$rc" "$FP"; printf 'LOG=%s\n' "$(tail -c 2500 "$DIR/job.log" | b64)"; } > "$DIR/result.txt"
+    if [ -z "$DOMAIN" ] && [ "$OP" = tuic ] && [ "$rc" = 0 ]; then FP=$(cert_fp "$TU_DIR/server.crt"); fi
+    { printf 'JOB=%s\nRC=%s\nFP=%s\nPBK=%s\n' "$JID" "$rc" "$FP" "$PBK"; printf 'LOG=%s\n' "$(tail -c 2500 "$DIR/job.log" | b64)"; } > "$DIR/result.txt"
 }
 
 # ---------------------------------------------------------------- 主循环
 heartbeat() {
-    printf 'VER=%s\nHOST=%s\nOS=%s\nS_HY2=%s\nS_ANYTLS=%s\n' "$AGENT_VER" "$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')" \
-        "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" | tr -cd 'A-Za-z0-9._ ()/-')" "$(svc_state "$HY_SVC")" "$(svc_state "$AT_SVC")"
+    printf 'VER=%s\nHOST=%s\nOS=%s\nS_HY2=%s\nS_ANYTLS=%s\nS_TUIC=%s\nS_REALITY=%s\n' "$AGENT_VER" "$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')" \
+        "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" | tr -cd 'A-Za-z0-9._ ()/-')" "$(svc_state "$HY_SVC")" "$(svc_state "$AT_SVC")" "$(svc_state "$TU_SVC")" "$(svc_state "$RE_SVC")"
     [ -s "$DIR/result.txt" ] && cat "$DIR/result.txt"
 }
 
@@ -370,7 +512,7 @@ agent_run() {
         NEXT=$INTERVAL
         if resp=$(heartbeat | curl -fsS -m 25 -X POST -H "X-Px-Token: $TOKEN" --data-binary @- "$WEB/px.php" 2>/dev/null); then
             fails=0
-            OP=""; JID=""; PORT=""; PASS=""; OBFS=""; SNI=""; HOP=""; DOMAIN=""
+            OP=""; JID=""; PORT=""; PASS=""; OBFS=""; SNI=""; HOP=""; DOMAIN=""; UUID=""; SID=""
             while IFS= read -r line; do
                 k=${line%%=*}; v=${line#*=}
                 case "$k" in
@@ -384,6 +526,8 @@ agent_run() {
                     SNI) SNI="$v" ;;
                     HOP) HOP="$v" ;;
                     DOMAIN) DOMAIN="$v" ;;
+                    UUID) UUID="$v" ;;
+                    SID) SID="$v" ;;
                 esac
             done <<< "$resp"
             if [ -n "$JID" ] && [ -n "$OP" ]; then
@@ -442,7 +586,7 @@ EOF
     systemctl restart "$SVC"
     sleep 2
     if systemctl is-active --quiet "$SVC"; then
-        echo "✅ agent 已安装并运行。回到小程序刷新，节点会显示在线，然后就可以安装 hy2 / anytls。"
+        echo "✅ agent 已安装并运行。回到小程序刷新，节点会显示在线，然后就可以安装 hy2 / anytls / tuic / reality。"
     else
         echo "agent 启动失败："; journalctl -u "$SVC" -n 10 --no-pager; exit 1
     fi
@@ -450,7 +594,7 @@ EOF
 
 case "${1:-}" in
     run) agent_run ;;
-    uninstall) need_root; do_uninstall; echo "agent 已卸载（hy2 / anytls 不受影响）" ;;
+    uninstall) need_root; do_uninstall; echo "agent 已卸载（hy2 / anytls / tuic / reality 不受影响）" ;;
     https://*) agent_install "$1" "$2" ;;
     *) echo "用法：bash px.sh 网址 节点密钥 | run | uninstall"; exit 1 ;;
 esac

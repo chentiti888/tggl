@@ -2539,6 +2539,86 @@ async def a_r2_edit(ctx, p):
             raise ApiError("合并分片失败：" + (m_.group(1).decode(errors="replace")[:120] if m_ else "未知错误"), 502)
         R2_USAGE["ts"] = 0; R2_LIVE.pop(name, None)
         return {"ok": True}
+    if op == "rename":
+        need_rate(ctx["uid"], 1)
+        kind = str(p.get("kind") or "")
+        old_key = _r2_key({"key": p.get("key")}, allow_dir=(kind == "folder"))
+        new_name = str(p.get("new_name") or "").strip()
+        if kind not in ("file", "folder"):
+            raise ApiError("请选择文件或文件夹")
+        if not new_name or new_name in (".", "..") or re.search(r"[/\\#?\x00-\x1f]", new_name) or len(new_name.encode()) > 255:
+            raise ApiError("新名称不正确：不能包含斜杠、#、? 或控制字符，且不能超过 255 字节")
+        if kind == "folder" and not old_key.endswith("/"):
+            raise ApiError("文件夹路径不正确")
+        if kind == "file" and old_key.endswith("/"):
+            raise ApiError("文件路径不正确")
+        clean_key = old_key.rstrip("/")
+        parent = clean_key.rsplit("/", 1)[0] + "/" if "/" in clean_key else ""
+        old_base = old_key.rstrip("/").rsplit("/", 1)[-1]
+        if new_name == old_base:
+            raise ApiError("新名称与原名称相同")
+        new_key = parent + new_name + ("/" if kind == "folder" else "")
+        keys = _r2_need_keys()
+
+        def rename_sync():
+            import xml.etree.ElementTree as ET
+            # 目标已存在时拒绝操作，避免覆盖现有对象。
+            try:
+                _s3_call_sync(acct["id"], "HEAD", name, new_key)
+                raise ApiError("目标名称已存在，请换一个名称")
+            except ApiError as e:
+                if getattr(e, "code", None) != 404 and "不存在" not in str(e):
+                    raise
+            if kind == "file":
+                src = "/" + name + "/" + _s3_quote(old_key, safe="-_.~/")
+                _s3_call_sync(acct["id"], "PUT", name, new_key, headers={"x-amz-copy-source": src})
+                _s3_call_sync(acct["id"], "DELETE", name, old_key)
+                return 1
+
+            # 文件夹是对象前缀：先完整收集，再复制全部对象，全部复制成功后才删除旧对象。
+            all_keys, cursor = [], None
+            while True:
+                q = {"list-type": "2", "max-keys": "1000", "prefix": old_key}
+                if cursor: q["continuation-token"] = cursor
+                _st, raw = _s3_call_sync(acct["id"], "GET", name, query=q)
+                root = ET.fromstring(raw)
+                ns = root.tag.split("}")[0] + "}" if root.tag.startswith("{") else ""
+                for node in root.findall(ns + "Contents"):
+                    k = node.find(ns + "Key")
+                    if k is not None and k.text: all_keys.append(k.text)
+                truncated = (root.findtext(ns + "IsTruncated") or "").lower() == "true"
+                tok = root.findtext(ns + "NextContinuationToken")
+                if not truncated: break
+                if not tok: raise ApiError("读取文件夹内容失败，缺少分页标记")
+                cursor = tok
+            if not all_keys: raise ApiError("文件夹已不存在或里面没有对象")
+            # 检查目标前缀下是否已有对象，防止覆盖或混合两个目录。
+            _st, raw = _s3_call_sync(acct["id"], "GET", name, query={"list-type": "2", "max-keys": "1", "prefix": new_key})
+            root = ET.fromstring(raw)
+            ns = root.tag.split("}")[0] + "}" if root.tag.startswith("{") else ""
+            if root.find(ns + "Contents") is not None or root.find(ns + "CommonPrefixes") is not None:
+                raise ApiError("目标文件夹名称已存在，请换一个名称")
+            copied = []
+            try:
+                for src_key in all_keys:
+                    dst_key = new_key + src_key[len(old_key):]
+                    src = "/" + name + "/" + _s3_quote(src_key, safe="-_.~/")
+                    _s3_call_sync(acct["id"], "PUT", name, dst_key, headers={"x-amz-copy-source": src})
+                    copied.append(dst_key)
+            except Exception:
+                # 复制阶段失败时尽量清理新前缀，旧对象仍保留。
+                for dst_key in copied:
+                    try: _s3_call_sync(acct["id"], "DELETE", name, dst_key)
+                    except Exception: pass
+                raise
+            for src_key in all_keys:
+                _s3_call_sync(acct["id"], "DELETE", name, src_key)
+            return len(all_keys)
+
+        count = await asyncio.to_thread(rename_sync)
+        _r2_audit(ctx, "rename", name, {"kind": kind, "from": old_key, "to": new_key, "objects": count})
+        R2_USAGE["ts"] = 0; R2_LIVE.pop(name, None)
+        return {"ok": True, "count": count}
     if op == "del":
         need_rate(ctx["uid"], 1)
         key = _r2_key(p, allow_dir=True)
@@ -4179,7 +4259,7 @@ SSH_JOBS_LOCK = threading.Lock()
 
 OWNER_ONLY.update({"ssh", "ssh_edit", "ssh_ls", "ssh_read", "ssh_write", "ssh_mkdir", "ssh_rm", "ssh_mv",
                    "ssh_up_begin", "ssh_up_chunk", "ssh_up_commit", "ssh_up_cancel", "ssh_up_state",
-                   "ssh_dl_begin", "ssh_dl_chunk", "ssh_ping", "r2_dl_begin", "r2_dl_chunk"})
+                   "ssh_dl_begin", "ssh_dl_chunk", "ssh_ping", "r2_dl_begin", "r2_dl_chunk", "ssh_chmod"})
 
 
 def _ssh_pm():
@@ -4606,6 +4686,21 @@ async def a_ssh_mv(ctx, p):
     return await asyncio.to_thread(_ssh_run, sid, go, src)
 
 
+@action("ssh_chmod", admin=True)
+async def a_ssh_chmod(ctx, p):
+    sid, path = p.get("id"), _ssh_path(p.get("path"))
+    m = str(p.get("mode") or "").strip()
+    if not re.fullmatch(r"[0-7]{3,4}", m):
+        raise ApiError("权限格式不正确，比如 644、755")
+    if path == "/":
+        raise ApiError("不能改根目录")
+
+    def go(sftp):
+        sftp.chmod(path, int(m, 8))
+        return {"ok": True}
+    return await asyncio.to_thread(_ssh_run, sid, go, path)
+
+
 def _ssh_rm_tree(sftp, path, depth=0, cnt=None):
     cnt = cnt if cnt is not None else [0]
     if depth > 30:
@@ -4946,14 +5041,16 @@ async def a_r2_dl_chunk(ctx, p):
 
 # ---------------------------------------------------------------- 安装代理（节点 agent + 订阅）
 # 在「工具 → 安装代理」添加节点，得到一行安装命令；在节点服务器上执行后装一个小程序（web/px.sh），
-# 它每 5 秒向 px.php 报到并领取任务（只向外发请求，不开任何端口）。之后在小程序里点安装 hy2 / anytls，
+# 它定时向 px.php 报到并领取任务（只向外发请求，不开任何端口）。之后在小程序里点安装 hy2 / anytls / tuic / reality，
 # 任务由节点上的 agent 执行。agent 与服务器之间用「KEY=VALUE」纯文本通信：服务器下发的值都先用正则校验，
 # agent 收到后再校验一次，不会执行服务器发来的任意命令。订阅地址：web/px.php?s=订阅密钥（只有所有者能看到）。
 
 PX_FILE = _data_path("nav_px.json")
 PX_LOCK = threading.Lock()
 PX_MAX = 50
-PX_VER = 5                          # agent 最新版本（px.sh 里的 AGENT_VER 要一致）
+PX_VER = 8                          # agent 最新版本（px.sh 里的 AGENT_VER 要一致）
+PX_TUIC_VER = 7                     # 支持 tuic 的最低 agent 版本
+PX_REALITY_VER = 8                  # 支持 reality 的最低 agent 版本
 PX_SH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "px.sh")   # agent 脚本放在机器人目录（网站目录被改也影响不到）
 PX_KEY_FILE = _data_path("nav_px_sign.key")                                 # 给 agent 脚本签名的私钥（自动生成，只有 root 能读）
 PX_ONLINE = 150                     # 超过 150 秒没报到 = 离线（agent 平时每 60 秒拉一次）
@@ -4963,12 +5060,17 @@ PX_HOT_FOR = 300                    # 加快持续 5 分钟，没人看了再回
 PX_HOT = {}                         # 节点 id → 加快到什么时候（只在内存里）
 PX_BUSY = 900                       # 正在执行任务时放宽到 15 分钟
 PX_LIVE = {}                        # 节点 id → {"ts", "ip", "st": {...}}（只在内存里）
-PX_OPS = ("update", "restart_hy2", "restart_anytls", "uninstall_agent", "rm_hy2", "rm_anytls", "hy2", "anytls")
+PX_PROTOS = ("hy2", "anytls", "tuic", "reality")
+PX_TCP = ("anytls", "reality")        # 走 TCP 的协议：端口不能互相冲突
+PX_UDP = ("hy2", "tuic")             # 走 UDP 的协议：端口不能互相冲突，也不能落在 hy2 的跳跃范围里
 PX_ALNUM = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 PX_SNI_RE = re.compile(r"^(?=.{1,100}$)[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$")
 PX_ADDR_RE = re.compile(r"^(?=.{1,100}$)[A-Za-z0-9.\-:]+$")
 
 OWNER_ONLY.update({"px", "px_domain", "px_check", "px_cf", "px_node", "px_node_edit", "px_install", "px_remove", "px_op", "px_sub", "px_links"})
+
+
+import uuid as _uuid  # noqa: E402
 
 
 def _px_load():
@@ -5003,6 +5105,11 @@ def _px_web():
 def _px_data():
     d = _px_load()
     d.setdefault("nodes", [])
+    gs = d.setdefault("groups", [])
+    for n in d["nodes"]:                      # 兼容：节点上已有的分组名，补进分组列表
+        g = n.get("group")
+        if g and g not in gs:
+            gs.append(g)
     if not d.get("sub"):
         d["sub"] = _px_rand(24)
         _px_save(d)
@@ -5037,7 +5144,10 @@ def _px_view(n, full=False):
            "host": n.get("host") or "", "os": n.get("os") or "", "ver": n.get("ver") or 0, "new_ver": PX_VER,
            "hy2": _px_proto_view(n.get("hy2"), st.get("hy2")),
            "anytls": _px_proto_view(n.get("anytls"), st.get("anytls")),
+           "tuic": _px_proto_view(n.get("tuic"), st.get("tuic")),
+           "reality": _px_proto_view(n.get("reality"), st.get("reality")),
            "busy": any(j["state"] in ("queue", "run") for j in n.get("jobs", [])),
+           "group": n.get("group") or "",
            "deleting": bool(n.get("del"))}
     if full:
         out["cmd"] = _px_cmd(n)
@@ -5097,8 +5207,8 @@ async def a_px(ctx, p):
         web = _px_web()
     except ApiError:
         web = ""
-    return {"web": bool(web), "domain": web, "custom": d.get("domain") or "", "nodes": [_px_view(n) for n in d["nodes"]],
-            "sub": _px_sub_urls(web, d["sub"]) if web else None}
+    return {"web": bool(web), "domain": web, "custom": d.get("domain") or "", "nodes": [_px_view(n) for n in d["nodes"]], "groups": list(d["groups"]),
+            "sub": _px_sub_urls(web, d["sub"], d.get("sub_name") or "") if web else None}
 
 
 @action("px_domain")
@@ -5121,9 +5231,9 @@ async def a_px_domain(ctx, p):
     return out
 
 
-def _px_sub_urls(web, tok):
+def _px_sub_urls(web, tok, name=""):
     b = f"{web}/px.php?s={tok}"
-    return {"auto": b, "clash": b + "&f=clash", "singbox": b + "&f=sb", "links": b + "&f=b64", "token": tok}
+    return {"auto": b, "clash": b + "&f=clash", "singbox": b + "&f=sb", "links": b + "&f=b64", "token": tok, "name": name}
 
 
 def _px_fetch(url, ua):
@@ -5160,7 +5270,7 @@ def _px_check_sync(web, tok):
             elif "f=b64" in path:
                 try:
                     links = base64.b64decode(text + "=" * (-len(text) % 4)).decode().split("\n")
-                    links = [x for x in links if x.startswith(("hysteria2://", "anytls://"))]
+                    links = [x for x in links if x.startswith(("hysteria2://", "anytls://", "tuic://", "vless://"))]
                 except Exception:
                     links = []
                 r["ok"] = bool(links)
@@ -5212,10 +5322,51 @@ async def a_px_node_edit(ctx, p):
             name = _txt(p.get("name"), 40).strip() or f"节点 {len(d['nodes']) + 1}"
             _px_web()
             n = {"id": _px_rand(8), "name": name, "token": _px_rand(32), "addr": "", "created": int(time.time()), "jobs": []}
+            g0 = _txt(p.get("group"), 20).strip()
+            if g0 and g0 in d["groups"]:
+                n["group"] = g0
             d["nodes"].append(n)
             PX_HOT[n["id"]] = time.time() + PX_HOT_FOR
             _px_save(d)
             return _px_view(n, True)
+        if op in ("group_add", "group_rename", "group_del", "group_order"):      # 分组本身：独立于节点，可以是空的
+            gs = d["groups"]
+            if op == "group_add":
+                g = _txt(p.get("name"), 20).strip()
+                if not g:
+                    raise ApiError("先填分组名", 400)
+                if g in gs or g == "未分组":
+                    raise ApiError("已经有这个分组了", 400)
+                if len(gs) >= 30:
+                    raise ApiError("最多 30 个分组", 400)
+                gs.append(g)
+            elif op == "group_rename":
+                old = str(p.get("old") or "")
+                g = _txt(p.get("name"), 20).strip()
+                if old not in gs:
+                    raise ApiError("分组不存在", 404)
+                if not g:
+                    raise ApiError("先填分组名", 400)
+                if g != old and (g in gs or g == "未分组"):
+                    raise ApiError("已经有这个分组了", 400)
+                gs[gs.index(old)] = g
+                for x in d["nodes"]:
+                    if x.get("group") == old:
+                        x["group"] = g
+            elif op == "group_del":
+                g = str(p.get("name") or "")
+                if g in gs:
+                    gs.remove(g)
+                for x in d["nodes"]:
+                    if x.get("group") == g:
+                        x.pop("group", None)
+            else:
+                o = p.get("groups")
+                if not isinstance(o, list) or sorted(map(str, o)) != sorted(gs):
+                    raise ApiError("参数不正确", 400)
+                d["groups"] = [str(x) for x in o]
+            _px_save(d)
+            return {"ok": True}
         n = _px_node_of(d, p.get("id"))
         if op == "ren":
             n["name"] = _txt(p.get("name"), 40).strip() or n["name"]
@@ -5223,6 +5374,16 @@ async def a_px_node_edit(ctx, p):
             if addr and not PX_ADDR_RE.match(addr):
                 raise ApiError("节点地址格式不对（填 IP 或域名，不要带 http:// 和端口）", 400)
             n["addr"] = addr
+            _px_save(d)
+            return {"ok": True}
+        if op == "group":                       # 把节点放进某个分组；空 = 未分组
+            g = _txt(p.get("group"), 20).strip()
+            if g and g not in d["groups"]:
+                raise ApiError("分组不存在", 404)
+            if g:
+                n["group"] = g
+            else:
+                n.pop("group", None)
             _px_save(d)
             return {"ok": True}
         if op == "token":                       # 重置安装密钥：旧 agent 立刻失效
@@ -5319,12 +5480,48 @@ async def a_px_cf(ctx, p):
     return {"ok": True}
 
 
+def _px_udp_clash(n, proto, port, hop=""):
+    """同一台节点上 UDP 端口冲突检查（hy2 / tuic；hy2 的跳跃范围会被 iptables 整段转给 hy2）。"""
+    lo, hi = (int(x) for x in hop.split("-")) if hop else (0, -1)
+    for other in PX_UDP:
+        c = n.get(other)
+        if other == proto or not c:
+            continue
+        if c.get("port") == port:
+            raise ApiError(f"UDP {port} 已经被 {other} 用了，换一个端口", 400)
+        if lo <= c.get("port", 0) <= hi:
+            raise ApiError(f"跳跃范围 {hop} 包含了 {other} 的端口 {c['port']}，会把它的流量转给 hy2，换一个范围", 400)
+    h = n.get("hy2")
+    if proto != "hy2" and h and h.get("hop"):
+        a, b = (int(x) for x in h["hop"].split("-"))
+        if a <= port <= b:
+            raise ApiError(f"UDP {port} 在 hy2 的跳跃范围 {h['hop']} 里，会被转给 hy2，换一个端口", 400)
+
+
+def _px_tcp_clash(n, proto, port):
+    """同一台节点上 TCP 端口冲突检查（anytls / reality）。"""
+    for other in PX_TCP:
+        c = n.get(other)
+        if other != proto and c and c.get("port") == port:
+            raise ApiError(f"TCP {port} 已经被 {other} 用了，换一个端口", 400)
+
+
+def _px_addr_after(n, proto, cfg):
+    """安装成功后再改节点地址（以前是下发任务就改，装失败了地址也被改成域名）。"""
+    if cfg.get("domain"):
+        n["addr"] = cfg["domain"]
+        return
+    old = (n.get(proto) or {}).get("domain")
+    if old and n.get("addr") == old and not any((n.get(x) or {}).get("domain") == old for x in PX_PROTOS if x != proto):
+        n["addr"] = ""
+
+
 @action("px_install")
 async def a_px_install(ctx, p):
     proto = str(p.get("proto") or "")
-    if proto not in ("hy2", "anytls"):
+    if proto not in PX_PROTOS:
         raise ApiError("不支持的协议", 400)
-    dom = str(p.get("domain") or "").strip().lower().rstrip(".")
+    dom = "" if proto == "reality" else str(p.get("domain") or "").strip().lower().rstrip(".")      # reality 不用证书
     if dom:                                  # 域名证书：先把域名解析到节点（灰云），节点上再用 80 端口向 Let's Encrypt 申请
         if not PX_SNI_RE.match(dom):
             raise ApiError("域名格式不对，比如 us1.example.com", 400)
@@ -5333,6 +5530,7 @@ async def a_px_install(ctx, p):
             ip0 = (PX_LIVE.get(n0["id"]) or {}).get("ip") or n0.get("ip") or ""
             if not _px_online(n0):
                 raise ApiError("节点不在线，请先在节点服务器执行安装命令", 400)
+            _px_busy(n0)                     # 先检查，避免节点忙时也去改了 DNS
             if int(n0.get("ver") or 0) < 4:
                 raise ApiError("节点程序太旧，不支持域名证书：先在节点页「⋯ → 更新节点程序」，等更新完再装", 400)
         if not ip0:
@@ -5344,6 +5542,10 @@ async def a_px_install(ctx, p):
         if not _px_online(n):
             raise ApiError("节点不在线，请先在节点服务器执行安装命令", 400)
         _px_busy(n)
+        if proto == "tuic" and int(n.get("ver") or 0) < PX_TUIC_VER:
+            raise ApiError("节点程序太旧，不支持 tuic：先在节点页「⋯ → 更新节点程序」，等更新完再装", 400)
+        if proto == "reality" and int(n.get("ver") or 0) < PX_REALITY_VER:
+            raise ApiError("节点程序太旧，不支持 reality：先在节点页「⋯ → 更新节点程序」，等更新完再装", 400)
         old = n.get(proto) or {}
         if proto == "hy2":
             port = _px_port(p.get("port"), 443, "hy2 ")
@@ -5358,17 +5560,27 @@ async def a_px_install(ctx, p):
                 if int(m.group(2)) - int(m.group(1)) < 10:
                     raise ApiError("跳跃范围太小，至少 10 个端口", 400)
                 hop = f"{int(m.group(1))}-{int(m.group(2))}"
+            _px_udp_clash(n, proto, port, hop)
             cfg = {"port": port, "sni": sni, "pass": old.get("pass") or _px_rand(20),
                    "obfs": (old.get("obfs") or _px_rand(16)) if p.get("obfs") else "", "hop": hop}
+        elif proto == "tuic":
+            port = _px_port(p.get("port"), 8443, "tuic ")
+            _px_udp_clash(n, proto, port)
+            cfg = {"port": port, "sni": _px_sni(p.get("sni"), "cdn.jsdelivr.net"), "pass": old.get("pass") or _px_rand(20),
+                   "uuid": old.get("uuid") or str(_uuid.uuid4())}
+        elif proto == "reality":
+            port = _px_port(p.get("port"), 443, "reality ")
+            _px_tcp_clash(n, proto, port)
+            sni = _px_sni(p.get("sni"), "www.microsoft.com")
+            cfg = {"port": port, "sni": sni, "uuid": old.get("uuid") or str(_uuid.uuid4()),
+                   "sid": old.get("sid") or os.urandom(4).hex(), "pbk": old.get("pbk") or ""}
         else:
             port = _px_port(p.get("port"), 8443, "anytls ")
+            _px_tcp_clash(n, proto, port)
             cfg = {"port": port, "sni": _px_sni(p.get("sni"), "cdn.jsdelivr.net"), "pass": old.get("pass") or _px_rand(20)}
         if dom:
             cfg["domain"] = dom
-            cfg["sni"] = dom
-            n["addr"] = dom                  # 订阅 / 导入链接用域名连接，才能和证书对上
-        elif old.get("domain") and n.get("addr") == old["domain"]:
-            n["addr"] = ""
+            cfg["sni"] = dom                 # 装好后订阅 / 导入链接改用域名连接（见 _px_addr_after），才能和证书对上
         j = _px_job(n, proto, **cfg)
         j["cfg"] = cfg
         _px_save(d)
@@ -5378,7 +5590,7 @@ async def a_px_install(ctx, p):
 @action("px_remove")
 async def a_px_remove(ctx, p):
     proto = str(p.get("proto") or "")
-    if proto not in ("hy2", "anytls"):
+    if proto not in PX_PROTOS:
         raise ApiError("不支持的协议", 400)
     with PX_LOCK:
         d = _px_data()
@@ -5394,7 +5606,7 @@ async def a_px_remove(ctx, p):
 @action("px_op")
 async def a_px_op(ctx, p):
     op = str(p.get("op") or "")
-    if op not in ("update", "restart_hy2", "restart_anytls"):
+    if op not in ("update",) + tuple("restart_" + x for x in PX_PROTOS):
         raise ApiError("不支持的操作", 400)
     with PX_LOCK:
         d = _px_data()
@@ -5411,10 +5623,18 @@ async def a_px_op(ctx, p):
 async def a_px_sub(ctx, p):
     with PX_LOCK:
         d = _px_data()
-        if str(p.get("op") or "") == "reset":
+        op = str(p.get("op") or "")
+        if op == "reset":
             d["sub"] = _px_rand(24)
             _px_save(d)
-        return _px_sub_urls(_px_web(), d["sub"])
+        elif op == "name":                      # 订阅名称：客户端导入后显示的名字，留空 = 不指定（客户端会用域名）
+            nm = re.sub(r"[\r\n\t]", " ", _txt(p.get("name"), 30)).strip()
+            if nm:
+                d["sub_name"] = nm
+            else:
+                d.pop("sub_name", None)
+            _px_save(d)
+        return _px_sub_urls(_px_web(), d["sub"], d.get("sub_name") or "")
 
 
 # ---- 导入链接 / 订阅内容
@@ -5434,6 +5654,12 @@ def _px_proxies(d, only=None):
         a = n.get("anytls")
         if a and a.get("ok"):
             out.append({"t": "anytls", "name": n["name"], "addr": addr, **a})
+        t = n.get("tuic")
+        if t and t.get("ok"):
+            out.append({"t": "tuic", "name": n["name"], "addr": addr, **t})
+        r = n.get("reality")
+        if r and r.get("ok") and r.get("pbk"):
+            out.append({"t": "reality", "name": n["name"], "addr": addr, **r})
     return out
 
 
@@ -5451,6 +5677,14 @@ def _px_link(x):
         if x.get("hop"):
             qs += [f"mport={x['hop']}", f"ports={x['hop']}"]         # mport：小火箭 / v2rayN；ports：官方写法
         return f"hysteria2://{q(x['pass'])}@{host}:{x['port']}/?{'&'.join(qs)}#{q(x['name'])}"
+    if x["t"] == "tuic":
+        qs = [f"sni={q(x['sni'])}", "alpn=h3", "congestion_control=bbr", "udp_relay_mode=native"]
+        if not x.get("domain"):
+            qs += ["insecure=1", "allowInsecure=1", "allow_insecure=1"]      # 各家客户端写法不同，都带上
+        return f"tuic://{x['uuid']}:{q(x['pass'])}@{host}:{x['port']}?{'&'.join(qs)}#{q(x['name'])}"
+    if x["t"] == "reality":
+        qs = ["encryption=none", "flow=xtls-rprx-vision", "security=reality", f"sni={q(x['sni'])}", "fp=chrome", f"pbk={q(x['pbk'])}", f"sid={x['sid']}", "type=tcp", "headerType=none"]
+        return f"vless://{x['uuid']}@{host}:{x['port']}?{'&'.join(qs)}#{q(x['name'])}"
     return f"anytls://{q(x['pass'])}@{host}:{x['port']}/?sni={q(x['sni'])}{'' if x.get('domain') else '&insecure=1&allowInsecure=1'}#{q(x['name'])}"
 
 
@@ -5464,7 +5698,7 @@ def _px_uniq(items):
     for x in items:
         cnt[x["name"]] = cnt.get(x["name"], 0) + 1
     for x in items:
-        nm = x["name"] if cnt[x["name"]] == 1 else x["name"] + " " + ("hy2" if x["t"] == "hy2" else "anytls")
+        nm = x["name"] if cnt[x["name"]] == 1 else x["name"] + " " + x["t"]
         base, i = nm, 2
         while nm in seen:
             nm, i = f"{base} {i}", i + 1
@@ -5485,6 +5719,15 @@ def _px_clash(items):
             L += ["    password: " + _px_yq(x["pass"]), "    sni: " + _px_yq(x["sni"]), "    skip-cert-verify: " + ("false" if x.get("domain") else "true"), "    udp: true"]
             if x.get("obfs"):
                 L += ["    obfs: salamander", "    obfs-password: " + _px_yq(x["obfs"])]
+        elif x["t"] == "reality":
+            L += ["    type: vless", f"    port: {x['port']}", "    uuid: " + _px_yq(x["uuid"]), "    network: tcp", "    udp: true", "    tls: true",
+                  "    flow: xtls-rprx-vision", "    servername: " + _px_yq(x["sni"]), "    client-fingerprint: chrome",
+                  "    reality-opts:", "      public-key: " + _px_yq(x["pbk"]), "      short-id: " + _px_yq(x["sid"])]
+        elif x["t"] == "tuic":
+            L += ["    type: tuic", f"    port: {x['port']}", "    uuid: " + _px_yq(x["uuid"]), "    password: " + _px_yq(x["pass"]),
+                  "    sni: " + _px_yq(x["sni"]), "    skip-cert-verify: " + ("false" if x.get("domain") else "true"),
+                  "    alpn: [h3]", "    congestion-controller: bbr", "    udp-relay-mode: native", "    reduce-rtt: true",
+                  "    request-timeout: 8000", "    udp: true"]
         else:
             L += ["    type: anytls", f"    port: {x['port']}", "    password: " + _px_yq(x["pass"]), "    sni: " + _px_yq(x["sni"]),
                   "    skip-cert-verify: " + ("false" if x.get("domain") else "true"), "    udp: true", "    client-fingerprint: chrome",
@@ -5510,6 +5753,13 @@ def _px_singbox(items):
                 o["server_ports"] = [x["hop"].replace("-", ":")]
             if x.get("obfs"):
                 o["obfs"] = {"type": "salamander", "password": x["obfs"]}
+        elif x["t"] == "reality":
+            o = {"type": "vless", "tag": x["name"], "server": x["addr"], "server_port": x["port"], "uuid": x["uuid"], "flow": "xtls-rprx-vision",
+                 "tls": {"enabled": True, "server_name": x["sni"], "utls": {"enabled": True, "fingerprint": "chrome"},
+                         "reality": {"enabled": True, "public_key": x["pbk"], "short_id": x["sid"]}}}
+        elif x["t"] == "tuic":
+            o = {"type": "tuic", "tag": x["name"], "server": x["addr"], "server_port": x["port"], "uuid": x["uuid"], "password": x["pass"],
+                 "congestion_control": "bbr", "udp_relay_mode": "native", "tls": {**tls, "alpn": ["h3"]}}
         else:
             o = {"type": "anytls", "tag": x["name"], "server": x["addr"], "server_port": x["port"], "password": x["pass"], "tls": tls}
         outs.append(o)
@@ -5596,6 +5846,7 @@ def px_sub_serve(headers, query):
         if not (tok and hmac.compare_digest(tok, d["sub"])):
             return 403, "text/plain; charset=utf-8", "订阅密钥不正确", {}
         items = _px_proxies(d)
+        sub_name = d.get("sub_name") or ""
     ua = headers.get("x-px-ua", "").lower()
     f = (q.get("f") or [""])[0]
     if f not in ("clash", "sb", "b64"):
@@ -5606,12 +5857,15 @@ def px_sub_serve(headers, query):
         else:
             f = "b64"
     exp = {"Profile-Update-Interval": "12", "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0"}
+    stem = urllib.parse.quote(sub_name, safe="") if sub_name else ""
+    if sub_name:                                  # 自定义名称：Profile-Title（Hiddify / v2rayN / Clash Meta 等）+ 文件名（Clash / Stash / Verge 等）
+        exp["Profile-Title"] = "base64:" + base64.b64encode(sub_name.encode()).decode()
     if f == "clash":
-        return 200, "text/yaml; charset=utf-8", _px_clash(items), {**exp, "Content-Disposition": "attachment; filename*=UTF-8''proxy.yaml"}
+        return 200, "text/yaml; charset=utf-8", _px_clash(items), {**exp, "Content-Disposition": f"attachment; filename*=UTF-8''{stem or 'proxy'}.yaml"}
     if f == "sb":
-        return 200, "application/json; charset=utf-8", _px_singbox(items), {**exp, "Content-Disposition": "attachment; filename*=UTF-8''sing-box.json"}
+        return 200, "application/json; charset=utf-8", _px_singbox(items), {**exp, "Content-Disposition": f"attachment; filename*=UTF-8''{stem or 'sing-box'}.json"}
     body = base64.b64encode("\n".join(_px_link(x) for x in items).encode()).decode()
-    return 200, "text/plain; charset=utf-8", body, exp
+    return 200, "text/plain; charset=utf-8", body, ({**exp, "Content-Disposition": f"attachment;filename*=UTF-8''{stem}"} if stem else exp)
 
 
 # ---- agent 通信（纯文本 KEY=VALUE）
@@ -5647,7 +5901,7 @@ def px_agent(headers, raw):
         now = time.time()
         dirty = False
         if True:
-            st = {"hy2": _px_svc(kv.get("S_HY2")), "anytls": _px_svc(kv.get("S_ANYTLS"))}
+            st = {"hy2": _px_svc(kv.get("S_HY2")), "anytls": _px_svc(kv.get("S_ANYTLS")), "tuic": _px_svc(kv.get("S_TUIC")), "reality": _px_svc(kv.get("S_REALITY"))}
             PX_LIVE[n["id"]] = {"ts": now, "ip": ip, "st": st}
             for k, v in (("ip", ip), ("host", _txt(kv.get("HOST"), 60)), ("os", _txt(kv.get("OS"), 60)),
                          ("ver", int(kv["VER"]) if re.fullmatch(r"\d{1,3}", kv.get("VER", "")) else 0), ("st", st), ("seen", 1)):
@@ -5660,6 +5914,9 @@ def px_agent(headers, raw):
             job = next((j for j in n.get("jobs", []) if j["id"] == jid), None)
             if job and job["state"] != "ok" and job["state"] != "fail":
                 ok = kv.get("RC") == "0"
+                pbk = kv.get("PBK", "").strip()
+                if ok and job["op"] == "reality" and not re.fullmatch(r"[A-Za-z0-9_-]{43}", pbk):
+                    ok = False                        # 没拿到公钥就生成不了客户端链接，按失败处理
                 job["state"] = "ok" if ok else "fail"
                 job["end"] = int(now)
                 try:
@@ -5667,13 +5924,16 @@ def px_agent(headers, raw):
                 except Exception:
                     job["log"] = ""
                 op = job["op"]
-                if ok and op in ("hy2", "anytls") and job.get("cfg"):
+                if ok and op in PX_PROTOS and job.get("cfg"):
                     cfg = dict(job["cfg"])
                     cfg["ok"] = True
                     if kv.get("FP", "").strip():
                         cfg["fp"] = _txt(kv["FP"], 100)
+                    if op == "reality":
+                        cfg["pbk"] = pbk
+                    _px_addr_after(n, op, cfg)
                     n[op] = cfg
-                elif ok and op in ("rm_hy2", "rm_anytls"):
+                elif ok and op in tuple("rm_" + x for x in PX_PROTOS):
                     n.pop(op[3:], None)
                 elif ok and op == "uninstall_agent" and n.get("del"):
                     d["nodes"] = [x for x in d["nodes"] if x is not n]
@@ -5693,7 +5953,7 @@ def px_agent(headers, raw):
             dirty = True
             a = job.get("args") or {}
             out += f"JOB={job['id']}\nOP={job['op']}\n"
-            for key, name in (("port", "PORT"), ("pass", "PASS"), ("obfs", "OBFS"), ("sni", "SNI"), ("hop", "HOP"), ("domain", "DOMAIN")):
+            for key, name in (("port", "PORT"), ("pass", "PASS"), ("obfs", "OBFS"), ("sni", "SNI"), ("hop", "HOP"), ("domain", "DOMAIN"), ("uuid", "UUID"), ("sid", "SID")):
                 if a.get(key) not in (None, ""):
                     out += f"{name}={a[key]}\n"
         if kv.get("VER", "").isdigit() and int(kv["VER"]) < PX_VER:
@@ -5730,6 +5990,68 @@ async def _px_gc_loop():
         except Exception as e:
             print("清理代理任务出错：", e)
         await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------- 节点掉线 / 恢复提醒（Telegram）
+# 节点超过 PX_ONLINE 秒没报到就算离线（正在跑任务时放宽到 PX_BUSY）。掉线发一条，恢复再发一条，中间不重复。
+# 掉线状态记在 nav_px.json 里（alert_down），机器人重启也不会漏发「恢复」。
+PX_BOOT = time.time()
+PX_WATCH_EVERY = 30
+
+
+async def _px_notify(text):
+    app = DNS_APP["app"]
+    if not app:
+        return
+    for uid in dh.ADMIN_IDS:
+        try:
+            await app.bot.send_message(chat_id=uid, text=text, disable_web_page_preview=True)
+        except Exception as e:
+            print("节点提醒发送失败：", e)
+
+
+def _px_watch_scan():
+    """返回要发的提醒文本列表，同时更新 alert_down。"""
+    now = time.time()
+    out = []
+    with PX_LOCK:
+        d = _px_data()
+        ch = False
+        for n in d["nodes"]:
+            if n.get("del"):
+                continue
+            tag = n["name"] + (f"（{n['group']}）" if n.get("group") else "")
+            if _px_online(n):
+                if n.get("alert_down"):
+                    mins = max(1, int((now - n.pop("alert_down")) // 60))
+                    out.append(f"🟢 节点已恢复：{tag}\n离线了 {mins} 分钟")
+                    ch = True
+                continue
+            if not n.get("seen") or n.get("alert_down"):
+                continue                                  # 从没上线过的不提醒；已经提醒过的不重复
+            if now - PX_BOOT < PX_ONLINE + 90:
+                continue                                  # 机器人刚重启，节点还没来得及报到
+            live = PX_LIVE.get(n["id"])
+            last = live["ts"] if live else None
+            n["alert_down"] = int(last or PX_BOOT)
+            ch = True
+            mins = max(1, int((now - (last or PX_BOOT)) // 60))
+            when = time.strftime("%H:%M", time.gmtime(last + 8 * 3600)) if last else "未知（机器人刚重启过）"
+            out.append(f"🔴 节点离线：{tag}\n已超过 {mins} 分钟没有报到，最后在线 {when}")
+        if ch:
+            _px_save(d)
+    return out
+
+
+async def _px_watch_loop():
+    await asyncio.sleep(30)
+    while True:
+        try:
+            for text in await asyncio.to_thread(_px_watch_scan):
+                await _px_notify(text)
+        except Exception as e:
+            print("节点掉线检查出错：", repr(e))
+        await asyncio.sleep(PX_WATCH_EVERY)
 
 
 async def respond_text(writer, code, body, ctype="text/plain; charset=utf-8", extra=None):
@@ -5988,7 +6310,7 @@ def _push_drop_dev(uid, dev):
 async def start_server():
     server = await asyncio.start_server(handle, CONF["host"], int(CONF["port"]))
     threading.Thread(target=_ipdb_loop, daemon=True).start()
-    for coro in (_dns_loop(), _lat_loop(), _push_loop(), _gh_clean_loop(), _ssh_clean_loop(), _px_gc_loop()):       # 后台循环：保留引用，避免被回收
+    for coro in (_dns_loop(), _lat_loop(), _push_loop(), _gh_clean_loop(), _ssh_clean_loop(), _px_gc_loop(), _px_watch_loop()):       # 后台循环：保留引用，避免被回收
         LAT_TASKS.add(asyncio.get_running_loop().create_task(coro))
     print(f"Mini App 接口已启动：http://{CONF['host']}:{CONF['port']}")
     return server
