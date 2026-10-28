@@ -146,12 +146,14 @@
     try { localStorage.removeItem('mini_dev'); } catch (e) {}
     setTimeout(function () { location.reload(); }, 800);
   }
+  // 下拉刷新期间追踪 API 请求，等页面数据请求结束后再开始收尾。
+  var ptrRefreshTracking = false, ptrRefreshPending = 0, ptrRefreshLastDone = 0, ptrRefreshGeneration = 0;
   function api(action, params, tries) {
     tries = tries == null ? 2 : tries;
     // 会改数据 / 会开任务的请求不自动重发，免得重复提交
     var safe = !/_edit$|^job_start$|^job_cancel$/.test(action);
     var httpSt = 0;
-    return fetch('api.php?a=' + encodeURIComponent(action), {
+    var request = fetch('api.php?a=' + encodeURIComponent(action), {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(params || {})
@@ -167,6 +169,16 @@
         throw new Error(j.error || '请求失败');
       }
       return j.data;
+    });
+    var tracked = ptrRefreshTracking;
+    var trackedGeneration = ptrRefreshGeneration;
+    if (tracked) ptrRefreshPending++;
+    return request.then(function (data) {
+      if (tracked && trackedGeneration === ptrRefreshGeneration) { ptrRefreshPending = Math.max(0, ptrRefreshPending - 1); ptrRefreshLastDone = Date.now(); }
+      return data;
+    }, function (err) {
+      if (tracked && trackedGeneration === ptrRefreshGeneration) { ptrRefreshPending = Math.max(0, ptrRefreshPending - 1); ptrRefreshLastDone = Date.now(); }
+      throw err;
     });
   }
   // 网站开了 5 秒盾（或安全级别很高）时，页面后台请求会收到 Cloudflare 的检查页而不是数据。
@@ -298,7 +310,119 @@
     });
     return f;
   }
-  function icon(name) { var s = el('span'); s.innerHTML = '<svg viewBox="0 0 24 24">' + ICON[name] + '</svg>'; return s.firstChild; }
+  var ICON_X = {
+    pxg: '<path d="M12 3.5l9 4.8-9 4.8-9-4.8z"/><path d="M3 12.6l9 4.8 9-4.8"/><path d="M3 16.9l9 4.6 9-4.6"/>',
+    more: '<circle cx="5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="19" cy="12" r="1.9"/>',
+    go: '<path d="M9.5 6l6 6-6 6"/>'
+  };
+  function moreBtn(label, fn, extra) {
+    var b = el('button', { class: 'ssh-more', type: 'button', 'aria-label': label || '更多', onclick: fn }); b.appendChild(icon('more')); return b;
+  }
+  // 节点分组：节点上设置了「分组」就用它；没设置就按名字里的国旗 / 国家名自动归到对应国家，认不出的放「其他」
+  var CTRY = [['US', '美国', ['美国', '美國']], ['JP', '日本', ['日本', '东京', '東京', '大阪']], ['HK', '香港', ['香港']], ['SG', '新加坡', ['新加坡', '狮城']],
+    ['TW', '台湾', ['台湾', '台灣']], ['KR', '韩国', ['韩国', '韓國', '首尔']], ['MO', '澳门', ['澳门', '澳門']], ['GB', '英国', ['英国', '英國', '伦敦']],
+    ['DE', '德国', ['德国', '德國', '法兰克福']], ['FR', '法国', ['法国', '法國', '巴黎']], ['NL', '荷兰', ['荷兰', '荷蘭']], ['CA', '加拿大', ['加拿大']],
+    ['AU', '澳大利亚', ['澳大利亚', '澳洲']], ['RU', '俄罗斯', ['俄罗斯', '俄羅斯']], ['IN', '印度', ['印度']], ['MY', '马来西亚', ['马来西亚']],
+    ['TH', '泰国', ['泰国']], ['VN', '越南', ['越南']], ['PH', '菲律宾', ['菲律宾']], ['ID', '印尼', ['印尼', '印度尼西亚']], ['TR', '土耳其', ['土耳其']],
+    ['BR', '巴西', ['巴西']], ['AR', '阿根廷', ['阿根廷']], ['CL', '智利', ['智利']], ['ZA', '南非', ['南非']], ['AE', '阿联酋', ['阿联酋', '迪拜']],
+    ['IT', '意大利', ['意大利']], ['ES', '西班牙', ['西班牙']], ['SE', '瑞典', ['瑞典']], ['CH', '瑞士', ['瑞士']], ['PL', '波兰', ['波兰']],
+    ['FI', '芬兰', ['芬兰']], ['UA', '乌克兰', ['乌克兰']], ['IE', '爱尔兰', ['爱尔兰']], ['NZ', '新西兰', ['新西兰']], ['MX', '墨西哥', ['墨西哥']],
+    ['CN', '中国', ['中国', '国内']]];      // 港澳台排在「中国」前面
+  function ctryFlag(code) { return String.fromCodePoint(0x1F1E6 + code.charCodeAt(0) - 65, 0x1F1E6 + code.charCodeAt(1) - 65); }
+  function ctryOf(name) {
+    name = String(name || '');
+    var m = name.match(/[\u{1F1E6}-\u{1F1FF}]{2}/u), code = '', hit = null, i, j;
+    if (m) { var cp = Array.from(m[0]); code = String.fromCharCode(cp[0].codePointAt(0) - 0x1F1E6 + 65, cp[1].codePointAt(0) - 0x1F1E6 + 65); }
+    for (i = 0; i < CTRY.length && !hit; i++) {
+      if (code) { if (CTRY[i][0] === code) hit = CTRY[i]; continue; }
+      for (j = 0; j < CTRY[i][2].length; j++) if (name.indexOf(CTRY[i][2][j]) >= 0) { hit = CTRY[i]; break; }
+    }
+    if (hit) return { code: hit[0], name: hit[1] };
+    if (code) { var nm = code; try { nm = new Intl.DisplayNames(['zh-CN'], { type: 'region' }).of(code) || code; } catch (e) {} return { code: code, name: nm }; }
+    return { code: '', name: '其他' };
+  }
+  var PX_NOGRP = '未分组';
+  function pxGroupOf(n) { return String(n.group || '').trim(); }
+  function pxGrpIcon() { return el('span', { class: 'dz-ic' }, icon('pxg')); }       // 节点分组：层叠图标，不用文件夹
+  function pxGroupOpts(d) { return [['', PX_NOGRP]].concat((d.groups || []).map(function (g) { return [g, g]; })); }
+  // 分组管理：分组是独立的，可以先建空分组，再把节点放进去
+  function pxGroupsMenu(d0) {
+    var bg = el('div', { class: 'sheet-bg', onclick: function (e) { if (e.target === bg) { bg.remove(); go(cur.tab, cur.sub, true); } } });
+    var box = el('div', { class: 'sheet' });
+    bg.appendChild(box); document.body.appendChild(bg);
+    function close() { bg.remove(); go(cur.tab, cur.sub, true); }
+    function load() { return api('px', null, 0).then(draw).catch(function (e) { toast(e.message, true); }); }
+    function act(fn) { run(null, function () { return fn().then(load); }); }
+    function draw(d) {
+      clear(box);
+      box.appendChild(el('h2', { text: '分组管理' }));
+      var cnt = {}, n0 = 0;
+      d.nodes.forEach(function (n) { if (n.group) cnt[n.group] = (cnt[n.group] || 0) + 1; else n0++; });
+      d.groups.forEach(function (g, i) {
+        box.appendChild(el('div', { class: 'grp-row' }, pxGrpIcon(), el('b', { text: g }), el('span', { class: 'grp-c', text: (cnt[g] || 0) + ' 个' }), el('span', { class: 'sp' }),
+          i ? el('button', { class: 'btn sm ghost', text: '上移', onclick: function () {
+            var o = d.groups.slice(); o.splice(i - 1, 0, o.splice(i, 1)[0]);
+            act(function () { return api('px_node_edit', { op: 'group_order', groups: o }); });
+          } }) : null,
+          el('button', { class: 'btn sm', text: '改名', onclick: function () {
+            sheet('分组改名', [{ key: 'name', label: '新名称', value: g }], '保存', function (v) { return api('px_node_edit', { op: 'group_rename', old: g, name: v.name }).then(load); });
+          } }),
+          el('button', { class: 'btn sm danger', text: '删除', onclick: function () {
+            confirmBox('删除分组「' + g + '」', '组里的 ' + (cnt[g] || 0) + ' 个节点会回到「' + PX_NOGRP + '」，节点本身不受影响。', function () { return api('px_node_edit', { op: 'group_del', name: g }).then(load); });
+          } })));
+      });
+      if (!d.groups.length) box.appendChild(el('div', { class: 'hint', style: 'margin:8px 0', text: '还没有分组。点下面「新建分组」，可以先建空分组，之后添加节点时选择，或在节点详情里「设置分组」。' }));
+      box.appendChild(el('div', { class: 'grp-row' }, pxGrpIcon(), el('b', { text: PX_NOGRP }), el('em', { class: 'grp-def', text: '默认' }), el('span', { class: 'grp-c', text: n0 + ' 个' })));
+      box.appendChild(el('button', { class: 'btn primary block', style: 'margin-top:12px', text: '＋ 新建分组', onclick: function () {
+        sheet('新建分组', [{ key: 'name', label: '分组名称', ph: '例如：新加坡 / 日本 / 落地机' }], '创建', function (v) { return api('px_node_edit', { op: 'group_add', name: v.name }).then(load); });
+      } }));
+      box.appendChild(el('div', { class: 'acts' }, el('button', { class: 'btn', text: '完成', onclick: close })));
+    }
+    draw(d0);
+    load();
+  }
+  function pxGroupList(box, d, rowFn) {
+    var nodes = d.nodes, fold = {}, q = '';
+    try { fold = JSON.parse(localStorage.getItem('mini_grp_px') || '{}') || {}; } catch (e) {}
+    var search = nodes.length >= 8 ? el('input', { class: 'input', placeholder: '🔍 搜索', autocomplete: 'off', autocapitalize: 'off', spellcheck: 'false', style: 'margin-bottom:10px' }) : null;
+    var body = el('div');
+    if (search) { box.appendChild(search); search.addEventListener('input', function () { q = search.value.trim().toLowerCase(); draw(); }); }
+    box.appendChild(body);
+    function draw() {
+      clear(body);
+      var list = q ? nodes.filter(function (n) { return n.name.toLowerCase().indexOf(q) >= 0 || pxGroupOf(n).toLowerCase().indexOf(q) >= 0; }) : nodes;
+      if (q && !list.length) { body.appendChild(el('div', { class: 'hint', style: 'text-align:center;margin:16px 0', text: '没有找到匹配的节点' })); return; }
+      if (!d.groups.length) {            // 一个分组都没建：平铺
+        var one = el('div', { class: 'card gh-card' }); list.forEach(function (n) { one.appendChild(rowFn(n)); }); body.appendChild(one); return;
+      }
+      var by = {}, names = d.groups.slice();
+      list.forEach(function (n) { var k = pxGroupOf(n) || PX_NOGRP; (by[k] = by[k] || []).push(n); });
+      if (by[PX_NOGRP]) names.push(PX_NOGRP);
+      names.forEach(function (k) {
+        var items = by[k] || [];
+        if (q && !items.length) return;
+        var closed = !q && !!fold[k], rows = el('div', { class: 'card gh-card' + (closed ? ' grp-closed' : '') });
+        var bad = items.some(function (n) { return n.seen && !n.online; });
+        items.forEach(function (n) { rows.appendChild(rowFn(n)); });
+        if (!items.length) rows.appendChild(el('div', { class: 'hint', style: 'padding:12px 14px', text: '空分组：在节点详情里「设置分组」放进来' }));
+        var h = el('button', { class: 'card dz grp-bar' + (closed ? ' closed' : '') + (bad ? ' grp-bad' : ''), type: 'button', onclick: function () {
+          if (q) return;
+          closed = !closed;
+          if (closed) fold[k] = 1; else delete fold[k];
+          try { localStorage.setItem('mini_grp_px', JSON.stringify(fold)); } catch (e) {}
+          h.classList.toggle('closed', closed); rows.classList.toggle('grp-closed', closed);
+        } }, pxGrpIcon(), el('span', { class: 'dz-t' }, el('b', { text: k })),
+          (function () {
+            var on = items.filter(function (n) { return n.online; }).length;
+            return el('small', { class: 'grp-n', style: bad ? 'color:var(--bad);font-weight:600' : '', text: items.length ? on + '/' + items.length : '0' });
+          })(), el('span', { class: 'go-ar grp-arr' }, icon('go')));
+        body.appendChild(h); body.appendChild(rows);
+      });
+    }
+    draw();
+  }
+  function goArrow() { return el('span', { class: 'go-ar' }, icon('go')); }
+  function icon(name) { var s = el('span'); s.innerHTML = '<svg viewBox="0 0 24 24">' + (ICON[name] || ICON_X[name]) + '</svg>'; return s.firstChild; }
 
   // ------------------------------------------------------------ 应用骨架
   var app = document.getElementById('app');
@@ -394,7 +518,7 @@
   }
   function devEntry(tab) {          // 管理页最下面的一行入口，点进去是子页面
     return el('button', { class: 'card dev-entry', onclick: function () { go(tab, 'devices'); } },
-      el('span', { class: 'dev-entry-t' }, el('b', { text: '主屏幕登录' }), el('small', { text: '配对码 · 已配对设备 · 离线推送' })), el('span', { class: 'st-go', text: '›' }));
+      el('span', { class: 'dev-entry-t' }, el('b', { text: '主屏幕登录' }), el('small', { text: '配对码 · 已配对设备 · 离线推送' })), goArrow());
   }
   function pageDevices(page) {
     page.appendChild(top('主屏幕登录', true));
@@ -1384,7 +1508,7 @@
             el('span', { class: 'dz-ic' }, icon('dns')),
             el('span', { class: 'dz-t' }, el('b', { text: z.name }), el('small', { class: ex.c, text: ex.t })),
             el('span', { class: 'pill ' + (z.status === 'active' && !z.paused ? 'ok' : 'warn'), text: zoneStatus(z) }),
-            el('span', { class: 'st-go', text: '›' })));
+            goArrow()));
         });
         holder.appendChild(el('div', { class: 'hint', text: '点一个域名管理它的解析记录。改动立刻生效，并记录在服务器的 cf_audit.jsonl 里。到期日每 12 小时更新一次。' }));
         if (d.exp_pending && polls < 12) {    // 到期日在后台查询：每 3 秒再取一次，最多等 36 秒
@@ -1911,14 +2035,14 @@
       holder.appendChild(el('button', { class: 'card dz', onclick: newBucket },
         el('span', { class: 'dz-ic swap', text: '＋' }),
         el('span', { class: 'dz-t' }, el('b', { text: '新建存储桶' }), el('small', { text: '名称只能用小写字母、数字和 -' })),
-        el('span', { class: 'st-go', text: '›' })));
+        goArrow()));
       if (!d.buckets.length) holder.appendChild(el('div', { class: 'card empty' }, el('span', { class: 'big wi' }, icon('bucket')), '这个账户下还没有存储桶'));
       d.buckets.forEach(function (b) {
         holder.appendChild(el('button', { class: 'card dz', onclick: function () { go('dns', 'r2b:' + b.name + ':'); } },
           el('span', { class: 'dz-ic' }, icon('bucket')),
           el('span', { class: 'dz-t' }, el('b', { text: b.name }), el('small', { text: r2Usage(b) + ' · ' + r2LocText(b.location) })),
           el('span', { class: 'pill ' + (b.public || b.domains ? 'ok' : ''), text: b.public || b.domains ? '公开' : '私有' }),
-          el('span', { class: 'st-go', text: '›' })));
+          goArrow()));
       });
       if (!d.s3) holder.appendChild(el('div', { class: 'card' }, permHint('还没配置 R2 的 Access Key，只能管理存储桶。要浏览、上传文件：Cloudflare → R2 → 管理 API 令牌，创建一个「对象读和写」的令牌，把 Access Key ID 和 Secret 写进机器人目录的 .env（R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY），重启机器人。')));
       holder.appendChild(el('div', { class: 'hint', text: '账户：' + d.account.name + '。' + (d.live ? '用量是遍历桶里的文件实时算出来的（缓存 1 分钟）' + (d.buckets.some(function (x) { return x.partial; }) ? '，文件太多的桶只统计了前 5 万个。' : '。') : d.usage ? '用量来自 Cloudflare 的统计，会晚几分钟到一两个小时，不是实时的；配好 R2 的 Access Key 后会改为实时。' : '看不到用量：Token 需要加「账户 → 账户分析 → 读取」权限。') }));
@@ -1972,7 +2096,7 @@
     var listBox = el('div'); listBox.appendChild(skeleton(4));
     var foot = el('div', { class: 'hint' });
     holder.appendChild(upBox); holder.appendChild(listBox); holder.appendChild(foot);
-    var data = { folders: [], files: [], next: null, public_url: null }, q = '', myEpoch = epoch, openKey = {};
+    var data = { folders: [], files: [], next: null, public_url: null }, q = '', myEpoch = epoch;
 
     function list(reset, cursor) {
       return api(A_LIST, { bucket: name, prefix: prefix, cursor: cursor || undefined }).then(function (x) {
@@ -1990,40 +2114,78 @@
       var fl = data.files.filter(function (f) { return !ql || f.key.toLowerCase().indexOf(ql) >= 0; });
       if (!data.folders.length && !data.files.length) listBox.appendChild(el('div', { class: 'card empty' }, el('span', { class: 'big wi' }, icon('folder')), prefix ? '这个文件夹是空的' : '桶里还没有文件，点「上传」放第一个'));
       fs.forEach(function (f) {
-        listBox.appendChild(el('button', { class: 'card dz fz', onclick: function () { go('dns', 'r2b:' + name + ':' + f); } },
-          el('span', { class: 'dz-ic' }, icon('folder')), el('span', { class: 'dz-t' }, el('b', { text: r2Name(f) })), el('span', { class: 'st-go', text: '›' })));
+        listBox.appendChild(el('div', { class: 'card dz fz', role: 'button', onclick: function () { go('dns', 'r2b:' + name + ':' + f); } },
+          el('span', { class: 'dz-ic' }, icon('folder')), el('span', { class: 'dz-t' }, el('b', { text: r2Name(f) })),
+          moreBtn('更多', function (e) { e.stopPropagation(); folderMenu(f); })));
       });
       fl.forEach(function (f) { listBox.appendChild(fileRow(f)); });
       if (data.next) listBox.appendChild(el('button', { class: 'btn block', style: 'margin-top:4px', text: '加载更多', onclick: function (e) { run(e.currentTarget, function () { return list(false, data.next); }); } }));
       foot.textContent = data.folders.length + ' 个文件夹 · ' + data.files.length + ' 个文件' + (data.next ? '（还有更多）' : '') + (data.public_url ? ' · 公开地址 ' + data.public_url : ' · 私有桶，下载链接 1 小时内有效');
     }
     function fileRow(f) {
-      var item = el('div', { class: 'note nitem dr' + (openKey[f.key] ? ' open' : '') });
-      var main = el('button', { class: 'dr-main', type: 'button' },
+      return el('div', { class: 'card dz fz' },
         el('span', { class: 'dz-ic' }, icon('file')),
-        el('span', { class: 'dr-t' }, el('b', { text: r2Name(f.key) }), el('small', { text: fmtBytes(f.size) + ' · ' + timeText(f.modified) })));
-      main.addEventListener('click', function () { item.classList.toggle('open'); if (item.classList.contains('open')) openKey[f.key] = 1; else delete openKey[f.key]; hap(); });
-      item.appendChild(el('div', { class: 'dr-h' }, main));
+        el('span', { class: 'dz-t' }, el('b', { text: r2Name(f.key) }), el('small', { text: fmtBytes(f.size) + ' · ' + timeText(f.modified) })),
+        moreBtn('更多', function () { fileMenu(f); }));
+    }
+    // 点 ⋯ 弹出的详情页（和 SFTP 页一致）：先 close() 再做事，避免弹层叠在一起
+    function menuSheet(title, rows, btns) {
+      var bg = el('div', { class: 'sheet-bg', onclick: function (e) { if (e.target === bg) bg.remove(); } });
+      function close() { bg.remove(); }
+      var box = el('div', { class: 'sheet' }, el('h2', { text: title }));
+      (rows || []).forEach(function (r) { if (r) box.appendChild(el('div', { class: 'kv' }, el('span', { text: r[0] }), el('span', { class: r[2] ? 'mono' : '', text: r[1] }))); });
+      btns.forEach(function (x, i) {
+        box.appendChild(el('button', { class: 'btn block' + (x[2] ? ' ' + x[2] : ''), style: 'margin-top:' + (i ? 8 : 12) + 'px', text: x[0], onclick: function (e) { close(); x[1](e); } }));
+      });
+      box.appendChild(el('div', { class: 'acts' }, el('button', { class: 'btn', text: '取消', onclick: close })));
+      bg.appendChild(box); document.body.appendChild(bg);
+    }
+    function folderMenu(f) {
+      menuSheet(r2Name(f).replace(/\/$/, ''), [['路径', f, 1]], [['重命名', function () { renameItem('folder', f); }]]);
+    }
+    function fileMenu(f) {
       var pub = data.public_url ? data.public_url.replace(/\/$/, '') + '/' + f.key.split('/').map(encodeURIComponent).join('/') : null;
-      item.appendChild(el('div', { class: 'nb' }, el('div', { class: 'nbi' }, el('div', { class: 'nbc' },
-        el('div', { class: 'kv' }, el('span', { text: '路径' }), el('span', { class: 'mono', text: f.key })),
-        el('div', { class: 'kv' }, el('span', { text: '大小' }), el('span', { text: fmtBytes(f.size) })),
-        f.type ? el('div', { class: 'kv' }, el('span', { text: '类型' }), el('span', { class: 'mono', text: f.type })) : null,
-        el('div', { class: 'kv' }, el('span', { text: '修改时间' }), el('span', { text: timeText(f.modified) })),
-        el('div', { class: 'row', style: 'margin-top:10px' },
-          el('button', { class: 'btn sm primary', style: 'flex:1', text: pub ? '复制链接' : '复制临时链接', onclick: function (e) {
-            if (pub) return copy(pub);
-            run(e.currentTarget, function () { return api(A_EDIT, { op: 'sign', bucket: name, key: f.key }).then(function (x) { copy(x.url); }); });
-          } }),
-          el('button', { class: 'btn sm', style: 'flex:1', text: '下载', onclick: function (e) {
-            sshDl('r2_dl_begin', { bucket: name, key: f.key }, 'r2_dl_chunk', r2Name(f.key));
-          } }),
-          el('button', { class: 'btn sm danger', style: 'flex:1', text: '删除', onclick: function () {
-            confirmBox('删除文件', f.key + '（' + fmtBytes(f.size) + '）删除后无法恢复。', function () {
-              return api(A_EDIT, { op: 'del', bucket: name, key: f.key }).then(function () { data.files = data.files.filter(function (x) { return x.key !== f.key; }); draw(); toast('已删除'); });
-            });
-          } }))))));
-      return item;
+      menuSheet(r2Name(f.key), [['路径', f.key, 1], ['大小', fmtBytes(f.size)], f.type ? ['类型', f.type, 1] : null, ['修改时间', timeText(f.modified)]], [
+        [pub ? '复制链接' : '复制临时链接', function () {
+          if (pub) return copy(pub);
+          api(A_EDIT, { op: 'sign', bucket: name, key: f.key }).then(function (x) { copy(x.url); }, function (e) { toast(e.message, true); });
+        }],
+        ['下载', function () { sshDl('r2_dl_begin', { bucket: name, key: f.key }, 'r2_dl_chunk', r2Name(f.key)); }],
+        ['重命名', function () { renameItem('file', f.key); }],
+        ['删除', function () {
+          confirmBox('删除文件', f.key + '（' + fmtBytes(f.size) + '）删除后无法恢复。', function () {
+            return api(A_EDIT, { op: 'del', bucket: name, key: f.key }).then(function () { data.files = data.files.filter(function (x) { return x.key !== f.key; }); draw(); toast('已删除'); });
+          });
+        }, 'danger']
+      ]);
+    }
+    function renameItem(kind, key) {
+      var isDir = kind === 'folder', cur0 = r2Name(key).replace(/\/$/, '');
+      var bg = sheet(isDir ? '重命名文件夹' : '重命名文件', [{ key: 'n', label: '新名称', value: cur0 }], '保存', function (v) {
+        var n = String(v.n || '').trim();
+        if (!n || n === '.' || n === '..' || /[\\\/#?]/.test(n) || /[\x00-\x1f]/.test(n)) {
+          throw new Error('名称不能为空，也不能包含 / \\ # ? 或控制字符');
+        }
+        if (n === cur0) throw new Error('新名称和原来一样');
+        return api(A_EDIT, { op: 'rename', bucket: name, kind: kind, key: key, new_name: n }).then(function (x) {
+          toast(isDir ? '已重命名，移动了 ' + (x && x.count || 0) + ' 个对象' : '已重命名');
+          return list(true);
+        }, function (e) {
+          // 文件夹很大时网关会先超时，但服务器还在继续改：刷新一下让你看到真实结果
+          if (isDir && /连接不上机器人接口|没有正确响应|网络不稳定/.test(e.message)) {
+            list(true).catch(function () {});
+            throw new Error('文件夹较大，服务器可能还在处理，已刷新目录，稍后再点刷新看结果');
+          }
+          throw e;
+        });
+      });
+      // 打开后只选中名字部分（不含扩展名），直接输入就是改名
+      setTimeout(function () {
+        var inp = bg.querySelector('input.input'); if (!inp) return;
+        var dot = isDir ? -1 : cur0.lastIndexOf('.');
+        inp.focus();
+        try { inp.setSelectionRange(0, dot > 0 ? dot : cur0.length); } catch (e) {}
+      }, 200);
     }
     function newFolder() {
       sheet('新建文件夹', [{ key: 'n', label: '文件夹名', ph: '例如 images' }], '创建', function (v) {
@@ -2388,6 +2550,7 @@
   // ============================================================ 远程服务器：用 SFTP 管理别的服务器上的文件（只有所有者能用）
   // 路由（都在「管理」标签页下）：ssh = 服务器列表；sshd:<服务器id>|<目录> = 浏览目录；sshf:<服务器id>|<文件> = 查看 / 编辑文件
   function sTab() { return cur.tab === 'tools' ? 'tools' : 'admin'; }
+  var sshAutoEdit = '';        // 从「⋯ → 编辑」进来的文件路径：打开文件页后直接进入编辑，保存 / 取消后回到目录
   function sshRoute(page, sub) {
     if (sub === 'ssh') return pageSshList(page);
     var i = sub.indexOf(':');
@@ -2396,23 +2559,29 @@
   }
   // ============================================================ 安装代理（节点 agent + 订阅）
   // 路由（工具标签页下）：px = 节点列表 + 订阅地址；pxn:<节点id> = 节点详情（安装 / 重装 / 卸载协议、导入链接）
-  var PX_OP = { hy2: '安装 hy2', anytls: '安装 anytls', rm_hy2: '卸载 hy2', rm_anytls: '卸载 anytls', restart_hy2: '重启 hy2', restart_anytls: '重启 anytls', update: '更新节点程序', uninstall_agent: '卸载节点程序' };
+  var PX_OP = { hy2: '安装 hy2', anytls: '安装 anytls', tuic: '安装 tuic', reality: '安装 reality', rm_hy2: '卸载 hy2', rm_anytls: '卸载 anytls', rm_tuic: '卸载 tuic', rm_reality: '卸载 reality',
+    restart_hy2: '重启 hy2', restart_anytls: '重启 anytls', restart_tuic: '重启 tuic', restart_reality: '重启 reality', update: '更新节点程序', uninstall_agent: '卸载节点程序' };
+  // 协议：[键, 名称, 未安装时的说明, 传输层, 默认端口]
+  var PX_PROTOS = [['hy2', 'Hysteria2', 'UDP · 可选混淆 / 端口跳跃', 'UDP', '443'], ['anytls', 'AnyTLS', 'TCP · sing-box 内核', 'TCP', '8443'],
+    ['tuic', 'TUIC', 'UDP · QUIC v5 · sing-box 内核', 'UDP', '8443'],
+    ['reality', 'VLESS Reality', 'TCP · 不需要域名和证书 · sing-box 内核', 'TCP', '443']];
+  function pxProto(k) { return PX_PROTOS.filter(function (x) { return x[0] === k; })[0]; }
   var PX_ST = { queue: '排队中', run: '执行中…', ok: '完成', fail: '失败' };
   function pxRoute(page, sub) {
     if (sub.indexOf('pxn:') === 0) return pageProxyNode(page, sub.slice(4));
     return pageProxy(page);
   }
   function pxTile() {
-    var sub = el('span', { class: 'st-sub', text: '一行命令装节点 · hy2 / anytls · 订阅地址' });
+    var sub = el('span', { class: 'st-sub', text: '一行命令装节点 · hy2 / anytls / tuic / reality · 订阅地址' });
     var ic = el('span', { class: 'st-ic breathe' }, icon('tools'));
     api('px', null, 0).then(function (d) {
       if (!d.nodes.length) return;
       var up = d.nodes.filter(function (n) { return n.online; }).length;
-      sub.textContent = d.nodes.length + ' 个节点 · ' + up + ' 个在线 · hy2 / anytls';
+      sub.textContent = d.nodes.length + ' 个节点 · ' + up + ' 个在线 · hy2 / anytls / tuic / reality';
       ic.classList.add(up === d.nodes.length ? 'on' : 'off');
     }, function () {});
     return el('button', { class: 'card srv-tile', onclick: function () { go('tools', 'px'); } },
-      ic, el('span', { class: 'st-tx' }, el('b', { text: '安装代理' }), sub), el('span', { class: 'st-go', text: '›' }));
+      ic, el('span', { class: 'st-tx' }, el('b', { text: '安装代理' }), sub), goArrow());
   }
   function pxCopyRow(tag, value, label) {
     return el('button', { class: 'gh-url', onclick: function () { copy(value); } },
@@ -2448,27 +2617,38 @@
     });
   }
   function pxSubCard(sub) {
-    var card = el('div', { class: 'card gh-clone' });
+    var card = el('div', { class: 'card gh-clone' }), open = false;
     function draw(s) {
       clear(card);
-      card.appendChild(el('h3', { class: 'h3i nobar' }, icon('link'), el('span', { text: '订阅地址' }), el('span', { class: 'sp' }),
-        el('button', { class: 'btn sm', style: 'margin-right:6px', text: '测试', onclick: function (e) { pxCheck(e.currentTarget); } }),
-        el('button', { class: 'btn sm', text: '重置', onclick: function () {
-          confirmBox('重置订阅密钥', '旧的订阅地址会立刻失效，客户端需要重新导入新地址。', function () { return api('px_sub', { op: 'reset' }).then(function (r) { draw(r); toast('已重置'); }); });
-        } })));
+      card.appendChild(el('h3', { class: 'h3i nobar sub-h' + (open ? '' : ' closed'), onclick: function () { open = !open; draw(s); } },
+        icon('link'), el('span', { text: '订阅地址' }), el('span', { class: 'sp' }), el('span', { class: 'go-ar grp-arr' }, icon('go'))));
+      if (!open) return;
       card.appendChild(pxCopyRow('自动', s.auto));
       card.appendChild(pxCopyRow('Clash', s.clash));
       card.appendChild(pxCopyRow('sing-box', s.singbox));
       card.appendChild(pxCopyRow('小火箭', s.links));
-      card.appendChild(el('div', { class: 'hint', text: '「自动」会按客户端识别格式；小火箭（Shadowrocket）、v2rayN、NekoBox 等用「小火箭」那一行（通用链接列表），Clash / Mihomo 用 Clash，sing-box / Hiddify 用 sing-box。订阅里只包含已装好的节点。' }));
+      var srUrl = 'shadowrocket://add/sub://' + btoa(s.links) + '?remark=' + encodeURIComponent(s.name || location.hostname);
+      card.appendChild(pxCopyRow('小火箭导入', srUrl));
+      card.appendChild(el('button', { class: 'btn sm block', style: 'margin-top:8px', text: '用小火箭打开（带上订阅名称）', onclick: function () { location.href = srUrl; } }));
+      card.appendChild(el('button', { class: 'gh-url px-dom', style: 'margin-top:10px', onclick: function () {
+        sheet('订阅名称', [{ key: 'name', label: '客户端导入后显示的名字（留空 = 不指定，客户端会显示域名）', value: s.name || '', ph: '比如：我的节点' }], '保存', function (v) {
+          return api('px_sub', { op: 'name', name: v.name }).then(function (r) { toast('已保存'); draw(r); });
+        }, el('div', { class: 'hint', style: 'margin:-2px 0 8px', text: '已经导入的订阅，要在客户端里「更新订阅」才会换成新名字；小火箭（Shadowrocket）不读响应里的名字：请用订阅地址下面的「用小火箭打开」导入，导入时会带上这个名称（和 Xboard 的做法一样）。' }));
+      } }, el('span', { class: 'gh-ut', text: '名称' }), el('span', { class: 'gh-uv', text: s.name || '未设置（显示域名）' }), el('span', { class: 'gh-uc', text: '修改' })));
+      card.appendChild(el('div', { class: 'row', style: 'margin-top:10px' },
+        el('button', { class: 'btn sm', style: 'flex:1', text: '测试', onclick: function (e) { pxCheck(e.currentTarget); } }),
+        el('button', { class: 'btn sm', style: 'flex:1', text: '重置', onclick: function () {
+          confirmBox('重置订阅密钥', '旧的订阅地址会立刻失效，客户端需要重新导入新地址。', function () { return api('px_sub', { op: 'reset' }).then(function (r) { draw(r); toast('已重置'); }); });
+        } })));
+      card.appendChild(el('div', { class: 'hint', text: '「自动」会按客户端识别格式；小火箭（Shadowrocket）、v2rayN、NekoBox 等用「小火箭」那一行（通用链接列表）；小火箭想带名称导入，点「用小火箭打开」，Clash / Mihomo 用 Clash，sing-box / Hiddify 用 sing-box。订阅里只包含已装好的节点。' }));
     }
     draw(sub);
     return card;
   }
   function pageProxy(page) {
     page.appendChild(top('安装代理', true));
-    var acts = el('div', { class: 'gh-acts' }), subBox = el('div'), card = el('div', { class: 'card gh-card' }, skeleton(2));
-    page.appendChild(acts); page.appendChild(card); page.appendChild(subBox);
+    var acts = el('div', { class: 'gh-acts' }), subBox = el('div'), card = el('div', { class: 'card gh-card' }, skeleton(2)), nodesBox = el('div');
+    page.appendChild(acts); page.appendChild(card); page.appendChild(nodesBox); page.appendChild(subBox);
     api('px').then(function (d) {
       clear(card);
       function domainSheet() {
@@ -2485,20 +2665,26 @@
         return;
       }
       acts.appendChild(el('button', { class: 'btn primary', text: '＋ 添加节点', onclick: function () {
-        sheet('添加节点', [{ key: 'name', label: '名称（随便起）', value: '', ph: '比如：东京 1' }], '生成安装命令', function (v) {
-          return api('px_node_edit', { op: 'add', name: v.name }).then(function (n) { pxCmdSheet(n.cmd, '在节点服务器上执行'); go('tools', 'pxn:' + n.id); });
+        sheet('添加节点', [{ key: 'name', label: '名称（随便起）', value: '', ph: '比如：东京 1' }].concat(d.groups.length ? [{ key: 'group', label: '分组', options: pxGroupOpts(d), value: '' }] : []), '生成安装命令', function (v) {
+          return api('px_node_edit', { op: 'add', name: v.name, group: v.group || '' }).then(function (n) { pxCmdSheet(n.cmd, '在节点服务器上执行'); go('tools', 'pxn:' + n.id); });
         });
       } }));
+      acts.appendChild(el('button', { class: 'btn', text: '分组', onclick: function () { pxGroupsMenu(d); } }));
       if (!d.nodes.length) card.appendChild(el('div', { class: 'hint', style: 'margin:8px 0', text: '还没有节点。点「添加节点」得到一行命令，到节点服务器上执行即可。' }));
-      d.nodes.forEach(function (n) {
-        var tags = [];
-        if (n.hy2) tags.push('hy2' + (n.hy2.hop ? '·跳跃' : '') + (n.hy2.obfs ? '·混淆' : ''));
-        if (n.anytls) tags.push('anytls');
-        card.appendChild(el('button', { class: 'gh-row', onclick: function () { go('tools', 'pxn:' + n.id); } },
-          el('span', { class: 'gh-ri ssh-st ' + (n.online ? 'on' : 'off') }, icon('srv')),
-          el('span', { class: 'gh-rt' }, el('b', { text: n.name }), el('small', { text: (n.addr || n.ip || '等待上线') + (tags.length ? ' · ' + tags.join(' · ') : (n.online ? ' · 未安装协议' : '')) })),
-          el('span', { class: 'st-go', text: '›' })));
-      });
+      if (d.nodes.length) {
+        card.remove();
+        pxGroupList(nodesBox, d, function (n) {
+          var tags = [];
+          if (n.hy2) tags.push('hy2' + (n.hy2.hop ? '·跳跃' : '') + (n.hy2.obfs ? '·混淆' : ''));
+          if (n.anytls) tags.push('anytls');
+          if (n.tuic) tags.push('tuic');
+          if (n.reality) tags.push('reality');
+          return el('button', { class: 'gh-row', onclick: function () { go('tools', 'pxn:' + n.id); } },
+            el('span', { class: 'gh-ri ssh-st ' + (n.online ? 'on' : 'off') }, icon('srv')),
+            el('span', { class: 'gh-rt' }, el('b', { text: n.name }), el('small', {}, !n.online && n.seen ? el('span', { style: 'color:var(--bad);font-weight:600', text: '离线 · ' }) : null, document.createTextNode((n.addr || n.ip || '等待上线') + (tags.length ? ' · ' + tags.join(' · ') : (n.online ? ' · 未安装协议' : '')))) ),
+            goArrow());
+        });
+      }
       subBox.appendChild(pxSubCard(d.sub));
       subBox.appendChild(el('button', { class: 'gh-url px-dom', onclick: domainSheet },
         el('span', { class: 'gh-ut', text: '域名' }), el('span', { class: 'mono gh-uv', text: d.domain }), el('span', { class: 'gh-uc', text: '修改' })));
@@ -2510,9 +2696,13 @@
     return s === 'active' ? '运行中' : s === 'failed' ? '已崩溃' : s === 'none' ? '服务不存在' : s === 'inactive' ? '已停止' : '检测中';
   }
   function pxProtoSheet(n, proto, onDone) {
-    var c = n[proto];
-    var fields = [
-      { key: 'port', label: proto === 'hy2' ? 'hy2 端口（UDP）' : 'anytls 端口（TCP）', value: c ? String(c.port) : (proto === 'hy2' ? '443' : '8443') },
+    var c = n[proto], pr = pxProto(proto);
+    var re = proto === 'reality';
+    var fields = re ? [
+      { key: 'port', label: proto + ' 端口（' + pr[3] + '）', value: c ? String(c.port) : pr[4] },
+      { key: 'sni', label: '伪装网站（借它的 TLS 握手；要支持 TLS 1.3，且节点能访问）', value: c ? c.sni : 'www.microsoft.com', ph: 'www.microsoft.com' }
+    ] : [
+      { key: 'port', label: proto + ' 端口（' + pr[3] + '）', value: c ? String(c.port) : pr[4] },
       { key: 'domain', label: '域名证书（可选）：托管在 Cloudflare 的域名，自动解析到节点并申请证书', value: c && c.domain ? c.domain : '', ph: '新的子域名，如 us1.example.com；留空 = 自签证书' },
       { key: 'sni', label: '伪装域名（SNI，仅自签证书时用）', value: c ? c.sni : 'cdn.jsdelivr.net' }
     ];
@@ -2521,11 +2711,11 @@
       fields.push({ key: 'hop', check: '开启端口跳跃（iptables 转发一段 UDP 端口）', value: c ? !!c.hop : false });
       fields.push({ key: 'hop_range', label: '跳跃端口范围（开启跳跃时生效）', value: c && c.hop ? c.hop : '20000-30000' });
     }
-    sheet((c ? '重新配置 ' : '安装 ') + (proto === 'hy2' ? 'Hysteria2' : 'AnyTLS'), fields, c ? '应用' : '开始安装', function (v) {
-      var p = { id: n.id, proto: proto, port: v.port, sni: v.sni, domain: v.domain };
+    sheet((c ? '重新配置 ' : '安装 ') + pr[1], fields, c ? '应用' : '开始安装', function (v) {
+      var p = { id: n.id, proto: proto, port: v.port, sni: v.sni, domain: re ? '' : v.domain };
       if (proto === 'hy2') { p.obfs = v.obfs; p.hop = v.hop; p.hop_range = v.hop_range; }
       return api('px_install', p).then(function () { toast('任务已下发'); onDone(); });
-    }, el('div', { class: 'hint', style: 'margin:-2px 0 8px', text: '不填域名 = 自签证书，客户端要开「允许不安全」。填域名 = 用 Cloudflare 自动建灰云解析（必须是没用过的新子域名，不能是订阅 / 小程序在用的域名），节点用 80 端口向 Let\'s Encrypt 申请正式证书（节点的 80 端口要空闲，云安全组要放行 TCP 80），客户端不用开允许不安全。' }));
+    }, el('div', { class: 'hint', style: 'margin:-2px 0 8px', text: re ? '不需要域名和证书。节点会自动生成密钥，客户端直接用导入链接 / 订阅即可（客户端要支持 Reality：v2rayN、Shadowrocket、NekoBox、Hiddify、Clash Meta、sing-box 都可以）。端口建议用 443；伪装网站换成别的也行，只要它支持 TLS 1.3。' : '不填域名 = 自签证书，客户端要开「允许不安全」。填域名 = 用 Cloudflare 自动建灰云解析（必须是没用过的新子域名，不能是订阅 / 小程序在用的域名），节点用 80 端口向 Let\'s Encrypt 申请正式证书（节点的 80 端口要空闲，云安全组要放行 TCP 80），客户端不用开允许不安全。' }));
   }
   function pageProxyNode(page, id) {
     page.appendChild(top('节点', true));
@@ -2552,7 +2742,7 @@
           el('span', { class: 'gh-ri ssh-st ' + (n.online ? 'on' : 'off') }, icon('srv')),
           el('span', { class: 'gh-rt' }, el('b', { text: n.name + (n.online ? ' · 在线' : ' · 离线') }),
             el('small', { text: (n.addr || n.ip || '地址未知') + (n.os ? ' · ' + n.os : '') + (n.ver && n.ver < n.new_ver ? ' · 有新版程序' : '') }))),
-        el('button', { class: 'ssh-more', text: '⋯', 'aria-label': '更多', onclick: function () { menu(n); } })));
+        moreBtn('更多', function () { menu(n); })));
       if (!n.seen) {
         head.appendChild(el('div', { class: 'hint', text: '还没有收到这个节点的报到。在节点服务器上执行安装命令后，这里会自动变成在线。' }));
         head.appendChild(el('button', { class: 'btn primary block', style: 'margin-top:10px', text: '查看安装命令', onclick: function () { pxCmdSheet(n.cmd); } }));
@@ -2560,12 +2750,12 @@
         head.appendChild(el('div', { class: 'hint', text: '节点现在连不上（服务器关机 / agent 没运行 / 网络不通）。恢复后会自动变回在线。' }));
       }
       clear(protos);
-      [['hy2', 'Hysteria2', 'UDP · 可选混淆 / 端口跳跃'], ['anytls', 'AnyTLS', 'TCP · sing-box 内核']].forEach(function (pr) {
+      PX_PROTOS.forEach(function (pr) {
         var c = n[pr[0]], card = el('div', { class: 'card' });
         card.appendChild(el('h3', { class: 'h3i nobar' }, icon('link'), el('span', { text: pr[1] }), el('span', { class: 'sp' }),
           el('span', { class: 'hint', style: 'margin:0', text: c ? pxSvcText(c) : '未安装' })));
         if (c) {
-          var info = (pr[0] === 'hy2' ? 'UDP ' : 'TCP ') + c.port + (c.domain ? ' · 证书 ' + c.domain : ' · 自签 SNI ' + c.sni);
+          var info = pr[3] + ' ' + c.port + (pr[0] === 'reality' ? ' · 伪装 ' + c.sni : c.domain ? ' · 证书 ' + c.domain : ' · 自签 SNI ' + c.sni);
           if (pr[0] === 'hy2') info += (c.obfs ? ' · 混淆' : '') + (c.hop ? ' · 跳跃 ' + c.hop : '');
           card.appendChild(el('div', { class: 'hint', style: 'margin:2px 0 10px', text: info }));
           card.appendChild(el('div', { class: 'gh-acts' },
@@ -2582,12 +2772,12 @@
       });
       // 导入链接
       clear(links);
-      if (n.hy2 || n.anytls) {
+      if (n.hy2 || n.anytls || n.tuic || n.reality) {
         var lc = el('div', { class: 'card gh-clone' }, el('h3', { class: 'h3i nobar' }, icon('link'), el('span', { text: '导入链接' })));
         links.appendChild(lc);
         api('px_links', { id: id }, 0).then(function (r) {
           if (!r.links.length) { lc.appendChild(el('div', { class: 'hint', text: '节点还没有可用地址：等它上线后会显示，或在「⋯」里手动填写节点地址。' })); return; }
-          r.links.forEach(function (x) { lc.appendChild(pxCopyRow(x.t === 'hy2' ? 'hy2' : 'anytls', x.link)); });
+          r.links.forEach(function (x) { lc.appendChild(pxCopyRow(x.t, x.link)); });
           lc.appendChild(el('div', { class: 'hint', text: '点一下复制，到客户端（v2rayN / Shadowrocket / NekoBox / Hiddify 等）选「从剪贴板导入」。整套节点用上面的订阅地址更方便。' }));
         }, function () {});
       }
@@ -2614,6 +2804,14 @@
             return api('px_node_edit', { op: 'ren', id: id, name: v.name, addr: v.addr }).then(again);
           });
         }),
+        item('设置分组', function () {
+          api('px', null, 0).then(function (d) {
+            if (!d.groups.length) { toast('还没有分组，先回列表页点「分组」新建', true); return; }
+            sheet('设置分组', [{ key: 'g', label: '放进哪个分组', options: pxGroupOpts(d), value: n.group || '' }], '保存', function (v) {
+              return api('px_node_edit', { op: 'group', id: id, group: v.g }).then(function () { toast('已保存'); again(); });
+            });
+          }, function (e) { toast(e.message, true); });
+        }),
         item('查看安装命令', function () { pxCmdSheet(n.cmd); }),
         n.online && n.ver < n.new_ver ? item('更新节点程序', function () { api('px_op', { id: id, op: 'update' }).then(load, function (e) { toast(e.message, true); }); }) : null,
         item('重置节点密钥（旧 agent 失效）', function () {
@@ -2622,7 +2820,7 @@
           });
         }),
         item('删除节点', function () {
-          confirmBox('删除节点', n.online ? '会让节点卸载 agent 并从列表移除；已装好的 hy2 / anytls 仍在运行，不受影响。' : '节点不在线，只从列表移除。以后要卸载 agent：bash /opt/px-agent/px.sh uninstall', function () {
+          confirmBox('删除节点', n.online ? '会让节点卸载 agent 并从列表移除；已装好的 hy2 / anytls / tuic / reality 仍在运行，不受影响。' : '节点不在线，只从列表移除。以后要卸载 agent：bash /opt/px-agent/px.sh uninstall', function () {
             return api('px_node_edit', { op: 'del', id: id, force: !n.online }).then(function () { toast('已删除'); backHandler(); });
           });
         }, 'danger'),
@@ -2644,7 +2842,7 @@
       }, function () {});
     }, function () {});
     return el('button', { class: 'card srv-tile', onclick: function () { go('tools', 'ssh'); } },
-      ic, el('span', { class: 'st-tx' }, el('b', { text: 'SFTP 服务器' }), sub), el('span', { class: 'st-go', text: '›' }));
+      ic, el('span', { class: 'st-tx' }, el('b', { text: 'SFTP 服务器' }), sub), goArrow());
   }
   function sshPJoin(dir, name) { return (dir === '/' ? '' : dir) + '/' + name; }
   function sshDirOf(p) { var i = p.lastIndexOf('/'); return i <= 0 ? '/' : p.slice(0, i); }
@@ -2712,9 +2910,8 @@
         card.appendChild(el('div', { class: 'ssh-r' },
           el('button', { class: 'gh-row', onclick: function () { go(sTab(), 'sshd:' + s.id + '|'); } },
             el('span', { class: 'gh-ri ssh-st', 'data-id': s.id }, icon('srv')),
-            el('span', { class: 'gh-rt' }, el('b', { text: s.name }), el('small', { text: s.user + '@' + s.host + (s.port !== 22 ? ':' + s.port : '') + (s.auth === 'key' ? ' · 私钥' : '') })),
-            el('span', { class: 'st-go', text: '›' })),
-          el('button', { class: 'ssh-more', text: '⋯', 'aria-label': '编辑', onclick: function () { sshEditSheet(s, function () { go(cur.tab, cur.sub, true); }); } })));
+            el('span', { class: 'gh-rt' }, el('b', { text: s.name }), el('small', { text: s.user + '@' + s.host + (s.port !== 22 ? ':' + s.port : '') + (s.auth === 'key' ? ' · 私钥' : '') }))),
+          moreBtn('编辑', function () { sshEditSheet(s, function () { go(cur.tab, cur.sub, true); }); })));
       });
       if (d.servers.length) api('ssh_ping', null, 0).then(function (r) {        // 在线绿 / 离线红（只试端口通不通）
         Array.prototype.forEach.call(card.querySelectorAll('.ssh-st'), function (n) { n.classList.add(r.up[n.getAttribute('data-id')] ? 'on' : 'off'); });
@@ -2907,6 +3104,28 @@
     }).catch(function (e) { if (!ps.stop) ps.fail(e.message); });
   }
 
+  function sshModeOctal(mode) {
+    mode = String(mode || '');
+    if (/^[0-7]{3,4}$/.test(mode)) return mode;
+    var n = 0;
+    for (var i = 0; i < 9; i++) {
+      var c = mode.charAt(i), bit = i % 3 === 0 ? 4 : i % 3 === 1 ? 2 : 1;
+      if (c !== '-' && c) n |= bit << (6 - Math.floor(i / 3) * 3);
+    }
+    return ('00' + n.toString(8)).slice(-3);
+  }
+  function sshChmod(id, path, currentMode, done) {
+    sheet('修改权限', [{ key: 'mode', label: '权限（八进制）', value: sshModeOctal(currentMode), ph: '例如：644、755、600' }], '保存', function (v) {
+      var mode = (v.mode || '').trim();
+      if (!/^[0-7]{3,4}$/.test(mode)) {
+        return Promise.reject(new Error('权限格式不正确，请输入 3 或 4 位八进制数字，例如 644、755'));
+      }
+      return api('ssh_chmod', { id: id, path: path, mode: mode }).then(function () {
+        toast('权限已修改'); done();
+      });
+    });
+  }
+
   function sshRename(id, path, done) {
     var old = path.split('/').pop();
     sheet('重命名', [{ key: 'n', label: '新名字', value: old }], '保存', function (v) {
@@ -2948,11 +3167,11 @@
       d.items.forEach(function (x) {
         var full = sshPJoin(path, x.name);
         card.appendChild(el('div', { class: 'ssh-r' },
-          el('button', { class: 'gh-row', onclick: function () { go(sTab(), (x.dir ? 'sshd:' : 'sshf:') + id + '|' + full); } },
+          el(x.dir ? 'button' : 'div', x.dir ? { class: 'gh-row', onclick: function () { go(sTab(), 'sshd:' + id + '|' + full); } } : { class: 'gh-row', style: 'cursor:default' },
             el('span', { class: 'gh-ri ' + (x.dir ? 'd' : 'f') }, ghIco(x.dir ? 'dir' : 'file')),
             el('span', { class: 'gh-rt' }, el('b', { text: x.name }), el('small', { text: (x.dir ? '' : fmtBytes(x.size) + ' · ') + sshAgo(x.mtime) + ' · ' + x.mode + (x.link ? ' · 链接' : '') })),
-            x.dir ? el('span', { class: 'st-go', text: '›' }) : null),
-          el('button', { class: 'ssh-more', text: '⋯', 'aria-label': '更多', onclick: function () { sshMenu(x, full); } })));
+            x.dir ? goArrow() : null),
+          moreBtn('更多', function () { sshMenu(x, full); })));
       });
       if (d.more) card.appendChild(el('div', { class: 'hint', text: '文件太多，只显示了前 3000 个。' }));
     }).catch(function (e) { clear(card).appendChild(failBox(e.message, function () { go(cur.tab, cur.sub, true); })); });
@@ -2960,7 +3179,9 @@
       var bg = el('div', { class: 'sheet-bg', onclick: function (e) { if (e.target === bg) bg.remove(); } });
       function close() { bg.remove(); }
       var box = el('div', { class: 'sheet' }, el('h2', { text: x.name }), el('div', { class: 'hint', text: full }));
-      if (!x.dir) box.appendChild(el('button', { class: 'btn block', style: 'margin-top:10px', text: '下载', onclick: function () { close(); sshDownload(id, full); } }));
+      if (!x.dir && x.size <= 512 * 1024) box.appendChild(el('button', { class: 'btn block', style: 'margin-top:10px', text: '编辑', onclick: function () { close(); sshAutoEdit = full; go(sTab(), 'sshf:' + id + '|' + full); } }));
+      box.appendChild(el('button', { class: 'btn block', style: 'margin-top:' + (!x.dir && x.size <= 512 * 1024 ? 8 : 10) + 'px', text: '修改权限', onclick: function () { close(); sshChmod(id, full, x.modeOctal || x.mode, function () { go(cur.tab, cur.sub, true); }); } }));
+      if (!x.dir) box.appendChild(el('button', { class: 'btn block', style: 'margin-top:8px', text: '下载', onclick: function () { close(); sshDownload(id, full); } }));
       box.appendChild(el('button', { class: 'btn block', style: 'margin-top:8px', text: '重命名', onclick: function () { close(); sshRename(id, full, function () { go(cur.tab, cur.sub, true); }); } }));
       box.appendChild(el('button', { class: 'btn block', style: 'margin-top:8px', text: '复制路径', onclick: function () { close(); copy(full); } }));
       box.appendChild(el('button', { class: 'btn danger block', style: 'margin-top:8px', text: '删除', onclick: function () { close(); sshDelete(id, full, x.dir, function () { go(cur.tab, cur.sub, true); }); } }));
@@ -2975,6 +3196,8 @@
     page.appendChild(sshCrumbs(id, path, true));
     var acts = el('div', { class: 'gh-acts' }); page.appendChild(acts);
     var card = el('div', { class: 'card gh-view' }, skeleton(4)); page.appendChild(card);
+    var auto = sshAutoEdit === path; sshAutoEdit = '';
+    function finish() { if (auto) backHandler(); else go(cur.tab, cur.sub, true); }
     function edit(f) {
       var crlf = /\r\n/.test(f.text), orig = f.text.replace(/\r\n/g, '\n');
       var ta = el('textarea', { class: 'gh-edit mono', spellcheck: 'false', autocapitalize: 'off', autocomplete: 'off', autocorrect: 'off', wrap: 'off' });
@@ -2985,8 +3208,8 @@
       function fit() { ta.style.height = 'auto'; ta.style.height = Math.max(240, ta.scrollHeight + 4) + 'px'; }
       ta.addEventListener('input', fit); setTimeout(fit, 0);
       cancel.addEventListener('click', function () {
-        if (ta.value === orig) { go(cur.tab, cur.sub, true); return; }
-        confirmBox('放弃修改', '改过的内容不会保存。', function () { go(cur.tab, cur.sub, true); return Promise.resolve(); });
+        if (ta.value === orig) { finish(); return; }
+        confirmBox('放弃修改', '改过的内容不会保存。', function () { finish(); return Promise.resolve(); });
       });
       save.addEventListener('click', function () {
         if (ta.value === orig) { toast('没有改动'); return; }
@@ -2995,7 +3218,7 @@
           return api('ssh_read', { id: id, path: path }).then(function (now) {
             if (now.mtime && f.mtime && now.mtime !== f.mtime && !window.confirm('这个文件在你打开之后被改过了，继续保存会覆盖那次修改。继续吗？')) throw new Error('已取消保存');
             return api('ssh_write', { id: id, path: path, text: text });
-          }).then(function () { toast('已保存'); go(cur.tab, cur.sub, true); });
+          }).then(function () { toast('已保存'); finish(); });
         });
       });
     }
@@ -3003,6 +3226,7 @@
       clear(card);
       card.appendChild(el('div', { class: 'gh-meta' }, el('span', { text: fmtBytes(f.size) }), f.text != null ? el('span', { text: (f.text ? f.text.replace(/\n$/, '').split('\n').length : 0) + ' 行' }) : null));
       if (f.text != null && f.editable) acts.appendChild(el('button', { class: 'btn primary', text: '编辑', onclick: function () { edit(f); } }));
+      if (auto && f.text != null && f.editable) edit(f);
       if (f.text != null) acts.appendChild(el('button', { class: 'btn', text: '复制内容', onclick: function () { copy(f.text); } }));
       acts.appendChild(el('button', { class: 'btn', onclick: function () { sshDownload(id, path); } }, ghIco('down'), el('span', { text: '下载' })));
       acts.appendChild(el('button', { class: 'btn', text: '重命名', onclick: function () { sshRename(id, path, function (n) { go(sTab(), 'sshf:' + id + '|' + sshPJoin(dir, n), true); }); } }));
@@ -3207,7 +3431,7 @@
           el('span', { class: 'gh-ri d' }, icon('dns')),
           el('span', { class: 'gh-rt' }, el('b', { text: z.name }), el('small', { class: ex.c, text: ex.t })),
           el('span', { class: 'pill ' + (z.status === 'active' && !z.paused ? 'ok' : 'warn'), text: zoneStatus(z) }),
-          el('span', { class: 'st-go', text: '›' })));
+          goArrow()));
       });
     }).catch(function (e) { setStat(0, '—'); setStat(1, '—'); clear(zc).appendChild(el('div', { class: 'hint', text: e.message })); });
     function drawR2(x) {
@@ -3223,7 +3447,7 @@
           el('span', { class: 'gh-ri' }, icon('bucket')),
           el('span', { class: 'gh-rt' }, el('b', { text: b.name }), el('small', { text: r2Usage(b) + ' · ' + r2LocText(b.location) })),
           el('span', { class: 'pill ' + (b.public || b.domains ? 'ok' : ''), text: b.public || b.domains ? '公开' : '私有' }),
-          el('span', { class: 'st-go', text: '›' })));
+          goArrow()));
       });
     }
     if (r2Data) drawR2(r2Data);
@@ -3316,7 +3540,7 @@
     return el('button', { class: 'gh-row', onclick: function () { go(gTab(), 'gitr:' + x.full + '|'); } },
       el('span', { class: 'gh-ri' }, ghIco(x.private ? 'lock' : 'git')),
       el('span', { class: 'gh-rt' }, el('b', { text: x.name }), el('small', { text: [x.private ? '私有' : '公开', x.lang, ghAgo(x.pushed) + '更新'].filter(Boolean).join(' · ') })),
-      el('span', { class: 'st-go', text: '›' }));
+      goArrow());
   }
   function ghNewRepo() {
     sheet('新建仓库', [
@@ -3484,7 +3708,7 @@
         } }, chk,
           el('span', { class: 'gh-ri ' + (x.type === 'dir' ? 'd' : 'f') }, ghIco(x.type === 'dir' ? 'dir' : 'file')),
           el('span', { class: 'gh-rt' }, el('b', { text: x.name }), x.type === 'file' ? el('small', { text: fmtBytes(x.size) }) : null),
-          x.type === 'dir' && !selMode ? el('span', { class: 'st-go', text: '›' }) : null));
+          x.type === 'dir' && !selMode ? goArrow() : null));
       });
       var n = Object.keys(picked).length;
       clear(delBar);
@@ -3715,7 +3939,7 @@
       all.forEach(function (c) {
         card.appendChild(el('button', { class: 'gh-row gh-cm', onclick: function () { go(gTab(), 'gitcd:' + repo + '|' + c.sha); } },
           el('span', { class: 'gh-rt' }, el('b', { text: c.msg.split('\n')[0] || '（无说明）' }), el('small', null, el('span', { class: 'mono', text: c.sha.slice(0, 7) }), ' · ' + c.author + ' · ' + ghAgo(c.date))),
-          el('span', { class: 'st-go', text: '›' })));
+          goArrow()));
       });
       if (more) card.appendChild(el('div', { class: 'gh-foot' }, el('span'), el('button', { class: 'btn sm', text: '加载更多', onclick: function (e) { run(e.currentTarget, load); } })));
     }
@@ -3774,7 +3998,7 @@
     var tabOf = me && me.owner ? 'admin' : 'tools';
     var ic = el('span', { class: 'ov-ic' }, el('i')), ttl = el('b', { text: '服务器监控' }), sub = el('span', { class: 'ov-sub', text: '读取中…' });
     var list = el('div', { class: 'ov-list' });
-    var head = el('button', { class: 'ov-h', onclick: function () { go(tabOf, 'servers'); } }, ic, el('span', { class: 'ov-tx' }, ttl, sub), el('span', { class: 'st-go', text: '›' }));
+    var head = el('button', { class: 'ov-h', onclick: function () { go(tabOf, 'servers'); } }, ic, el('span', { class: 'ov-tx' }, ttl, sub), goArrow());
     var box = el('div', { class: 'card ov load' }, head, list);
     livePoll(function () {
       return api('servers').then(function (sv) {
@@ -3799,7 +4023,7 @@
       el('span', { class: 'st-ic' }, icon('srv')),
       el('span', { class: 'st-tx' }, el('b', { text: '服务器监控' }), sub),
       sum && sum.total ? el('span', { class: 'pill ' + (sum.online === sum.total ? 'ok' : 'warn') }, el('i', { class: 'dot' }), sum.online + '/' + sum.total) : null,
-      el('span', { class: 'st-go', text: '›' }));
+      goArrow());
     return tile;
   }
   // 上传/下载：数字加一条渐隐细线（按对数刻度，10MB/s 记满；几 B 到几十 MB 都看得出差别）
@@ -3892,7 +4116,7 @@
         el('span', { class: 'dz-t' }, el('b', { text: name })),
         // 右边状态点：绿 = 全部在线，黄 = 有离线，红 = 全部离线
         el('i', { class: 'sdot grp-dot' + (!items.length ? ' off' : !off ? '' : on ? ' warn' : ' bad'), title: items.length ? on + '/' + items.length + ' 在线' : '还没有服务器' }),
-        el('span', { class: 'st-go grp-arr', text: '›' }));
+        el('span', { class: 'go-ar grp-arr' }, icon('go')));
       items.forEach(function (s) { g.appendChild(card(s)); });
       if (!items.length) g.appendChild(el('div', { class: 'hint grp-empty', text: '这个分组还没有服务器。打开服务器详情点「分组」，或添加服务器时选这个分组。' }));
       list.appendChild(h); list.appendChild(g);
@@ -4056,12 +4280,37 @@
 
   // ------------------------------------------------------------ 启动
   if (!initData && !devTok) { pairPage(); return; }
-  // 下拉刷新：页面在最顶部时往下拉，松手重新载入当前页（弹层打开时、输入框里不触发）
-  // 只在主屏幕 App 里启用：Telegram 里往下拉是收起小程序，两者会冲突
+  // 下拉刷新：只显示 iOS 风格动态指示器，不显示任何「下拉刷新 / 松手刷新」文字。
+  // 只在主屏幕 App 里启用：Telegram 里往下拉是收起小程序，两者会冲突。
   if (!initData) (function () {
-    var ind = el('div', { class: 'ptr', text: '↓' }), y0 = 0, dy = 0, on = false, busy = false, TH = 70;
+    var ind = el('div', { class: 'ptr' }), y0 = 0, dy = 0, on = false, busy = false, TH = 70;
+    // 指示器背景透明，只保留 iOS 风格动态圆环；下拉时页面内容跟手下移。
+    ind.style.background = 'transparent';
+    ind.style.border = '0';
+    ind.style.boxShadow = 'none';
+    ind.style.backdropFilter = 'none';
+    ind.style.webkitBackdropFilter = 'none';
+    var ptrStyle = el('style', { text: '@keyframes ptr-ios-rotate{to{transform:rotate(360deg)}}.ptr-ios-spinner{position:relative;display:inline-block;width:19px;height:19px;vertical-align:middle;animation:ptr-ios-rotate .85s steps(8) infinite}.ptr-ios-spinner i{position:absolute;left:8px;top:1px;width:3px;height:6px;border-radius:2px;background:currentColor;transform-origin:1.5px 8.5px}.ptr-ios-spinner i:nth-child(1){transform:rotate(0deg);opacity:1}.ptr-ios-spinner i:nth-child(2){transform:rotate(45deg);opacity:.88}.ptr-ios-spinner i:nth-child(3){transform:rotate(90deg);opacity:.76}.ptr-ios-spinner i:nth-child(4){transform:rotate(135deg);opacity:.64}.ptr-ios-spinner i:nth-child(5){transform:rotate(180deg);opacity:.52}.ptr-ios-spinner i:nth-child(6){transform:rotate(225deg);opacity:.4}.ptr-ios-spinner i:nth-child(7){transform:rotate(270deg);opacity:.28}.ptr-ios-spinner i:nth-child(8){transform:rotate(315deg);opacity:.16}' });
+    document.head.appendChild(ptrStyle);
+    function showIosSpinner() {
+      if (ind.querySelector('.ptr-ios-spinner')) return; // 不在每次 touchmove 时重置动画
+      clear(ind);
+      var spinner = el('span', { class: 'ptr-ios-spinner', 'aria-label': '刷新中' });
+      for (var si = 0; si < 8; si++) spinner.appendChild(el('i'));
+      ind.appendChild(spinner);
+    }
     document.body.appendChild(ind);
-    function reset() { ind.style.transform = 'translate(-50%,-60px)'; ind.style.opacity = '0'; ind.classList.remove('go'); }
+    function reset() { ind.style.transform = 'translate(-50%,-60px)'; ind.style.opacity = '0'; ind.classList.remove('go'); clear(ind); }
+    function settlePage(done) {
+      app.style.transition = 'transform .22s cubic-bezier(.2,.75,.25,1)';
+      app.style.transform = 'translateY(0px)';
+      setTimeout(function () {
+        app.style.transition = '';
+        app.style.transform = '';
+        app.style.willChange = '';
+        if (done) done();
+      }, 230);
+    }
     reset();
     document.addEventListener('touchstart', function (e) {
       on = false; dy = 0;
@@ -4074,21 +4323,49 @@
       dy = e.touches[0].clientY - y0;
       if (dy <= 0) { reset(); return; }
       var d = Math.min(dy * .5, 90);
-      ind.style.transform = 'translate(-50%,' + (d - 40) + 'px)'; ind.style.opacity = String(Math.min(1, d / 50));
-      ind.textContent = d >= TH * .5 ? '↑ 松手刷新' : '↓ 下拉刷新';
-      ind.classList.toggle('go', d >= TH * .5);
+      showIosSpinner(); // 任意下拉距离都只显示同一个 iOS 动态指示器，不显示文字状态
+      app.style.transition = 'none';
+      app.style.willChange = 'transform';
+      app.style.transform = 'translateY(' + d + 'px)';
+      ind.style.transform = 'translate(-50%,' + (d - 40) + 'px)';
+      ind.style.opacity = String(Math.min(1, d / 50));
     }, { passive: true });
     function end() {
       if (!on) return; on = false;
-      var fire = dy * .5 >= TH * .5; reset();
+      var fire = dy * .5 >= TH * .5;
       if (fire && cur) {
+        showIosSpinner();
+        ind.style.transform = 'translate(-50%,10px)'; ind.style.opacity = '1';
         busy = true; hap('ok');
+        // 等本轮页面刷新请求全部结束，再额外停留 0.2 秒；隐藏指示器后 0.10 秒再回弹。
+        // 每轮使用独立代号，超时后迟到的旧请求不能修改新一轮的计数。
+        ptrRefreshGeneration++;
+        ptrRefreshPending = 0;
+        ptrRefreshLastDone = Date.now();
+        ptrRefreshTracking = true;
         try { go(cur.tab, cur.sub, true); } catch (e) {}
-        setTimeout(function () { busy = false; }, 800);
+        var refreshWaitStart = Date.now();
+        (function waitRefreshDone() {
+          var now = Date.now();
+          var idleDone = ptrRefreshPending === 0 && now - ptrRefreshLastDone >= 200;
+          // 兜底：异常请求不能让页面永久停在下拉状态。
+          if (idleDone || now - refreshWaitStart >= 3000) {
+            ptrRefreshTracking = false;
+            reset();
+            setTimeout(function () {
+              settlePage(function () { busy = false; });
+            }, 100);
+          } else {
+            setTimeout(waitRefreshDone, 50);
+          }
+        })();
+      } else {
+        settlePage();
+        reset();
       }
     }
     document.addEventListener('touchend', end, { passive: true });
-    document.addEventListener('touchcancel', function () { on = false; reset(); }, { passive: true });
+    document.addEventListener('touchcancel', function () { on = false; settlePage(); reset(); }, { passive: true });
     // 左边缘右滑返回（和 iOS 原生一样）：从屏幕最左边往右拖，当前页跟着手往右走，下面垫着上一页的画面；
     // 拖过三分之一或快速一划就返回上一页，不够就弹回
     var ex = 0, ey = 0, et = 0, edx = 0, st = 0, under = null, dim = null, prev = null;   // st：0 没在拖，1 刚按下还没判断方向，2 正在拖

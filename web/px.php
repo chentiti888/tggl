@@ -68,7 +68,7 @@ $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 if ($out === false) fail(502, "ERR=upstream\n");
 http_response_code($code >= 200 && $code < 600 ? $code : 502);
-foreach (['content-type', 'content-disposition', 'profile-update-interval', 'subscription-userinfo', 'x-px-sig'] as $h) {
+foreach (['content-type', 'content-disposition', 'profile-update-interval', 'profile-title', 'subscription-userinfo', 'x-px-sig'] as $h) {
     if (isset($respHeaders[$h])) header($h . ': ' . $respHeaders[$h]);
 }
 echo $out;

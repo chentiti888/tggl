@@ -1567,9 +1567,18 @@ html:not(.standalone) .pg-home6 > .clock { margin-top: 8px; padding-bottom: 4px;
 
 /* 远程服务器（SFTP） */
 .ssh-r { display: flex; align-items: center; border-top: 1px solid var(--line); }
-.gh-card > .ssh-r:first-child { border-top: 0; }
+.gh-card > .ssh-r:first-child, .card > .ssh-r:first-child { border-top: 0; }
 .ssh-r .gh-row { border-top: 0; flex: 1; min-width: 0; }
-.ssh-more { flex: none; border: 0; background: none; color: var(--faint); font-size: 22px; line-height: 1; padding: 8px 10px; cursor: pointer; }
+.ssh-more { flex: none; display: flex; align-items: center; justify-content: center; align-self: stretch; border: 0; background: none; color: var(--faint); padding: 0 10px; cursor: pointer; }
+.ssh-more svg { width: 22px; height: 22px; fill: currentColor; stroke: none; display: block; }
+.go-ar { flex: none; display: flex; align-items: center; justify-content: center; color: var(--faint); padding: 0 2px; }
+.go-ar svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; display: block; }
+.grp-n { color: var(--faint); font-size: 13px; margin-right: 2px; }
+.gh-card.grp-closed { display: none; }
+.sub-h { cursor: pointer; -webkit-user-select: none; user-select: none; }
+.sub-h .grp-arr { transform: rotate(90deg); transition: transform .2s; }
+.sub-h.closed .grp-arr { transform: rotate(0deg); }
+.sub-h.closed { margin-bottom: 0; }
 .ssh-more:active { opacity: .5; }
 .gh-ri.ssh-st.on { color: var(--ok); background: rgba(52, 199, 89, .15); }
 .gh-ri.ssh-st.off { color: var(--bad); background: rgba(255, 69, 58, .15); }
@@ -1646,3 +1655,6 @@ html:not(.standalone) .pg-home6 > .clock { margin-top: 8px; padding-bottom: 4px;
 .px-job small { margin-left: auto; font-size: 11.5px; color: var(--faint); }
 .px-log { margin: 2px 0 8px; padding: 9px 10px; border-radius: 10px; background: rgba(127, 127, 127, .09); font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; max-height: 220px; overflow: auto; }
 .px-dom { margin-top: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; width: 100%; }
+
+/* 分组里有节点离线：图标和箭头变红 */
+.grp-bar.grp-bad .dz-ic, .grp-bar.grp-bad .grp-arr { color: var(--bad); }
