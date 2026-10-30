@@ -4151,23 +4151,47 @@ async def a_gh_up_state(ctx, p):
     return {k: v for k, v in st.items() if k != "uid"}
 
 
+def _gh_step(name, fn):
+    """执行一步 GitHub 调用；出错时在提示里带上是哪一步。"""
+    try:
+        return fn()
+    except GhNotFound:
+        raise ApiError(f"{name}时 GitHub 返回「找不到」（仓库、分支不存在，或令牌没有写入权限）", 400)
+    except GhEmpty:
+        raise ApiError("仓库还是空的", 400)
+    except ApiError as e:
+        if name not in str(e):
+            raise ApiError(f"{name}失败：{e}", getattr(e, "code", 400))
+        raise
+
+
 def _gh_del_sync(repo, paths, msg):
-    info, _h = _gh_call_sync("GET", "/repos/" + repo)
+    info, _h = _gh_step("读取仓库", lambda: _gh_call_sync("GET", "/repos/" + repo))
     branch = info.get("default_branch") or "main"
-    ref, _h = _gh_call_sync("GET", f"/repos/{repo}/git/ref/heads/{_gh_q(branch)}")
+    ref, _h = _gh_step("读取分支", lambda: _gh_call_sync("GET", f"/repos/{repo}/git/ref/heads/{_gh_q(branch)}"))
     base = ref["object"]["sha"]
-    commit, _h = _gh_call_sync("GET", f"/repos/{repo}/git/commits/{base}")
-    full, _h = _gh_call_sync("GET", f"/repos/{repo}/git/trees/{commit['tree']['sha']}", query={"recursive": "1"})
+    commit, _h = _gh_step("读取提交", lambda: _gh_call_sync("GET", f"/repos/{repo}/git/commits/{base}"))
+    full, _h = _gh_step("读取文件列表", lambda: _gh_call_sync("GET", f"/repos/{repo}/git/trees/{commit['tree']['sha']}", query={"recursive": "1"}))
     if full.get("truncated"):
         raise ApiError("仓库文件太多，没法在这里删除，请到 GitHub 网站上删")
-    gone = [x["path"] for x in full.get("tree") or [] if x.get("type") == "blob"
-            and any(x["path"] == q or x["path"].startswith(q + "/") for q in paths)]
+    blobs = [x for x in full.get("tree") or [] if x.get("type") == "blob"]
+    hit = [x for x in blobs if any(x["path"] == q or x["path"].startswith(q + "/") for q in paths)]
+    gone = [x["path"] for x in hit]
     if not gone:
         raise ApiError("没有找到要删除的文件")
+    if len(hit) == len(blobs):
+        # 删完仓库就空了：Git 树接口不允许提交空目录树，改用文件接口逐个删除
+        last = None
+        for x in hit:
+            r, _h = _gh_step("删除文件", lambda x=x: _gh_call_sync(
+                "DELETE", f"/repos/{repo}/contents/{_gh_q(x['path'])}",
+                {"message": msg, "sha": x["sha"], "branch": branch}, timeout=60))
+            last = ((r or {}).get("commit") or {}).get("sha") or last
+        return {"sha": last or base, "n": len(gone)}
     tree = [{"path": q, "mode": "100644", "type": "blob", "sha": None} for q in gone]
-    t, _h = _gh_call_sync("POST", f"/repos/{repo}/git/trees", {"base_tree": commit["tree"]["sha"], "tree": tree})
-    c, _h = _gh_call_sync("POST", f"/repos/{repo}/git/commits", {"message": msg, "tree": t["sha"], "parents": [base]})
-    _gh_call_sync("PATCH", f"/repos/{repo}/git/refs/heads/{_gh_q(branch)}", {"sha": c["sha"]})
+    t, _h = _gh_step("创建新文件树", lambda: _gh_call_sync("POST", f"/repos/{repo}/git/trees", {"base_tree": commit["tree"]["sha"], "tree": tree}))
+    c, _h = _gh_step("创建提交", lambda: _gh_call_sync("POST", f"/repos/{repo}/git/commits", {"message": msg, "tree": t["sha"], "parents": [base]}))
+    _gh_step("更新分支", lambda: _gh_call_sync("PATCH", f"/repos/{repo}/git/refs/heads/{_gh_q(branch)}", {"sha": c["sha"]}))
     return {"sha": c["sha"], "n": len(gone)}
 
 

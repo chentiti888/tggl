@@ -10,7 +10,7 @@
 # 服务器下发的任务只有固定几种（安装 / 卸载 hy2、anytls、tuic、reality，重启，更新），参数都会再校验一遍。
 # 更新 agent 时新脚本必须通过签名校验（公钥在下面 PX_PUB，安装时由机器人填入），否则拒绝替换。
 
-AGENT_VER=8
+AGENT_VER=14
 PX_PUB=""
 DIR=/opt/px-agent
 SVC=px-agent
@@ -24,6 +24,8 @@ TU_SVC=tuic-server.service
 RE_DIR=/etc/reality                       # VLESS + Reality：同样用共用的 sing-box，不需要证书
 RE_SVC=reality-server.service
 HOP_SVC=px-hop.service
+FWD_SVC=px-fwd.service                       # 端口转发：内核 iptables DNAT，不跑额外进程
+HY_STAT_PORT=25413                           # hy2 流量统计接口，只听本机
 INTERVAL=10              # 默认 10 秒拉一次；以服务器下发的 NEXT 为准（有人在看 / 有任务时 3 秒）
 
 # ---------------------------------------------------------------- 小工具
@@ -38,6 +40,15 @@ pkg_install() {            # pkg_install 命令名 [包名]
     elif command -v apk >/dev/null 2>&1; then apk add --no-cache "$p" >/dev/null 2>&1
     fi
     command -v "$1" >/dev/null 2>&1
+}
+
+port80_busy() {            # 80 端口是否被占用。只用系统自带的 ss（ELF 程序）：有人在 /usr/local/bin 放了同名脚本会死循环，所以不走 PATH
+    local b
+    for b in /usr/bin/ss /usr/sbin/ss /bin/ss /sbin/ss; do
+        [ -x "$b" ] && head -c4 "$b" 2>/dev/null | grep -q ELF || continue
+        timeout 10 "$b" -ltn 2>/dev/null | grep -qE '[:.]80[[:space:]]'; return
+    done
+    return 1
 }
 
 b64() { base64 -w0 2>/dev/null || base64 | tr -d '\n'; }
@@ -70,6 +81,10 @@ CERT_DIR=/etc/px-cert
 CERT_CRT=""; CERT_KEY=""
 get_cert() {
     local dom="$1" dir="$CERT_DIR/$1" out rc acme="$HOME/.acme.sh/acme.sh"
+    # 已经有证书、至少还有 14 天有效：直接沿用（改端口 / 加分享账号重装时不用再占 80 端口去申请）
+    if [ -s "$dir/fullchain.pem" ] && [ -s "$dir/key.pem" ] && openssl x509 -in "$dir/fullchain.pem" -noout -checkend 1209600 >/dev/null 2>&1; then
+        CERT_CRT="$dir/fullchain.pem"; CERT_KEY="$dir/key.pem"; echo "沿用已有证书"; return 0
+    fi
     pkg_install curl; pkg_install socat; pkg_install openssl
     if ! command -v crontab >/dev/null 2>&1; then
         pkg_install crontab cron || pkg_install crontab cronie
@@ -80,16 +95,17 @@ get_cert() {
         curl -fsSL --connect-timeout 15 https://get.acme.sh 2>/dev/null | sh -s email="px@$dom" >/dev/null 2>&1
         [ -x "$acme" ] || { echo "acme.sh 安装失败（节点连不上 get.acme.sh / github？）"; return 1; }
     fi
-    if ss -ltn 2>/dev/null | grep -qE '[:.]80[[:space:]]'; then echo "80 端口被占用（nginx / apache？），无法申请证书"; return 1; fi
+    if port80_busy; then echo "80 端口被占用（nginx / apache？），无法申请证书"; return 1; fi
     fw_open 80 tcp
-    "$acme" --set-default-ca --server letsencrypt >/dev/null 2>&1
+    local SAFE_PATH=/usr/sbin:/usr/bin:/sbin:/bin     # acme.sh 内部也会调用 ss；PATH 里去掉 /usr/local/bin，避免被同名脚本顶替而卡死
+    env PATH=$SAFE_PATH "$acme" --set-default-ca --server letsencrypt >/dev/null 2>&1
     echo "向 Let's Encrypt 申请 $dom 的证书..."
-    out=$("$acme" --issue -d "$dom" --standalone --httpport 80 --keylength ec-256 2>&1); rc=$?
+    out=$(env PATH=$SAFE_PATH timeout 300 "$acme" --issue -d "$dom" --standalone --httpport 80 --keylength ec-256 2>&1); rc=$?
     if [ "$rc" != 0 ] && [ "$rc" != 2 ]; then
         echo "申请证书失败（检查：域名是否解析到本机 / 云厂商安全组是否放行 TCP 80）："; echo "$out" | tail -n 8; return 1
     fi
     mkdir -p "$dir"
-    "$acme" --install-cert -d "$dom" --ecc --fullchain-file "$dir/fullchain.pem" --key-file "$dir/key.pem" \
+    env PATH=$SAFE_PATH "$acme" --install-cert -d "$dom" --ecc --fullchain-file "$dir/fullchain.pem" --key-file "$dir/key.pem" \
         --reloadcmd "for s in hysteria-server anytls-server tuic-server; do systemctl is-enabled --quiet \$s.service 2>/dev/null && systemctl restart \$s.service >/dev/null 2>&1; done; true" >/dev/null 2>&1 \
         || { echo "安装证书失败"; return 1; }
     chmod 755 "$CERT_DIR" "$dir"; chmod 644 "$dir/fullchain.pem"
@@ -152,7 +168,83 @@ EOF
     echo "端口跳跃已开启：UDP $1 → $port"
 }
 
-job_hy2() {                # 需要 PORT PASS SNI；可选 OBFS HOP
+# ---------------------------------------------------------------- 分享账号（USERS=编号:uuid:密码,... ；由机器人下发，每个分享一组独立账号）
+valid_users() {
+    local e id uu pw n
+    [ -z "$USERS" ] && return 0
+    n=$(printf '%s' "$USERS" | tr ',' '\n' | wc -l)
+    [ "$n" -le 100 ] || return 1
+    local IFS=','
+    for e in $USERS; do
+        IFS=: read -r id uu pw <<< "$e"
+        [[ "$id" =~ ^[a-z0-9]{8}$ ]] || return 1
+        [[ "$uu" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+        [[ "$pw" =~ ^[A-Za-z0-9]{16}$ ]] || return 1
+    done
+    return 0
+}
+
+hy_stat_secret() {         # 统计接口密钥：第一次用时随机生成，只有 root 能读
+    local f="$HY_DIR/stats.secret"
+    [ -s "$f" ] || ( umask 077; head -c 200 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 24 > "$f" )
+    cat "$f"
+}
+
+hy_users_yaml() {          # 有分享账号：改成 userpass（owner 是自己，其余是分享）并打开本机流量统计
+    local e id uu pw
+    echo "auth:"
+    echo "  type: userpass"
+    echo "  userpass:"
+    echo "    \"owner\": \"$PASS\""
+    local IFS=','
+    for e in $USERS; do
+        IFS=: read -r id uu pw <<< "$e"
+        echo "    \"$id\": \"$pw\""
+    done
+    echo "trafficStats:"
+    echo "  listen: 127.0.0.1:$HY_STAT_PORT"
+    echo "  secret: \"$(hy_stat_secret)\""
+}
+
+sb_users() {               # sb_users anytls|tuic|reality → sing-box users 数组的内容（自己的账号在最前）
+    local out e id uu pw
+    case "$1" in
+        anytls) out="{\"name\": \"user\", \"password\": \"$PASS\"}" ;;
+        tuic) out="{\"name\": \"user\", \"uuid\": \"$UUID\", \"password\": \"$PASS\"}" ;;
+        reality) out="{\"name\": \"user\", \"uuid\": \"$UUID\", \"flow\": \"xtls-rprx-vision\"}" ;;
+    esac
+    local IFS=','
+    for e in $USERS; do
+        IFS=: read -r id uu pw <<< "$e"
+        case "$1" in
+            anytls) out="$out, {\"name\": \"$id\", \"password\": \"$pw\"}" ;;
+            tuic) out="$out, {\"name\": \"$id\", \"uuid\": \"$uu\", \"password\": \"$pw\"}" ;;
+            reality) out="$out, {\"name\": \"$id\", \"uuid\": \"$uu\", \"flow\": \"xtls-rprx-vision\"}" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# 流量统计：读一次就清零，累加在 tr.pend 里，机器人回 TRACK 确认收到后才删（没收到就下次接着报，不会丢）
+tr_collect() {
+    local sec out pr
+    for pr in anytls tuic reality; do
+        [ -f "$DIR/sbstat.$pr" ] && sb_stat_read "$(sb_stat_port "$pr")" >> "$DIR/tr.pend"
+    done
+    [ -s "$HY_DIR/stats.secret" ] || return 0
+    sec=$(cat "$HY_DIR/stats.secret" 2>/dev/null)
+    out=$(curl -fsS -m 3 -H "Authorization: $sec" "http://127.0.0.1:$HY_STAT_PORT/traffic?clear=1" 2>/dev/null) || return 0
+    printf '%s' "$out" | grep -oE '"[a-z0-9]{8}":\{"tx":[0-9]+,"rx":[0-9]+\}' \
+        | sed -E 's/"([a-z0-9]{8})":\{"tx":([0-9]+),"rx":([0-9]+)\}/\1 \2 \3/' \
+        | while read -r i a b; do echo "$i $((a + b))"; done >> "$DIR/tr.pend"
+}
+
+tr_line() {
+    [ -s "$DIR/tr.pend" ] || return 0
+    awk '{s[$1]+=$2} END{o=""; for(k in s){o=o (o==""?"":",") k ":" sprintf("%d", s[k])} print "TR=" o}' "$DIR/tr.pend"
+}
+
+job_hy2() {                # 需要 PORT PASS SNI；可选 OBFS HOP、USERS
     pkg_install curl; pkg_install openssl
     if ! command -v hysteria >/dev/null 2>&1; then
         echo "安装 Hysteria2 内核..."
@@ -169,9 +261,12 @@ job_hy2() {                # 需要 PORT PASS SNI；可选 OBFS HOP
         echo "tls:"
         echo "  cert: $crt"
         echo "  key: $key"
-        echo "auth:"
-        echo "  type: password"
-        echo "  password: \"$PASS\""
+        if [ -n "$USERS" ]; then hy_users_yaml
+        else
+            echo "auth:"
+            echo "  type: password"
+            echo "  password: \"$PASS\""
+        fi
         if [ -n "$OBFS" ]; then
             echo "obfs:"
             echo "  type: salamander"
@@ -184,6 +279,7 @@ job_hy2() {                # 需要 PORT PASS SNI；可选 OBFS HOP
         echo "    url: https://$masq/"
         echo "    rewriteHost: true"
     } > "$HY_DIR/config.yaml"
+    [ -n "$USERS" ] || rm -f "$HY_DIR/stats.secret" "$DIR/tr.pend"
     chmod 640 "$HY_DIR/config.yaml"; id hysteria >/dev/null 2>&1 && chown hysteria:hysteria "$HY_DIR/config.yaml"
     fw_open "$PORT" udp
     systemctl daemon-reload >/dev/null 2>&1
@@ -259,6 +355,84 @@ at_install_bin() {
     at_bin_ok || { echo "sing-box 版本过低（anytls 需要 >= 1.12.0）"; return 1; }
 }
 
+# ---------------------------------------------------------------- 统计版 sing-box（anytls / tuic / reality 按分享统计流量用）
+# 官方 sing-box 没编译用户统计功能；机器人目录里放了自己编译的（带 v2ray_api），agent 从机器人下载并验签后替换共用的 sing-box。
+sb_stat_port() { case "$1" in anytls) echo 25421 ;; tuic) echo 25422 ;; reality) echo 25423 ;; esac; }
+
+at_stats_ok() { [ -x "$AT_BIN" ] && "$AT_BIN" version 2>/dev/null | grep -q with_v2ray_api; }
+
+at_install_stats() {
+    local arch tmp sig
+    arch=$(at_arch); [ -n "$arch" ] || { echo "不支持的架构：$(uname -m)"; return 1; }
+    pkg_install curl; pkg_install openssl
+    tmp=$(mktemp -d)
+    echo "下载统计版 sing-box ($arch)..."
+    curl -fsS --connect-timeout 10 -m 300 -D "$tmp/h" -o "$tmp/sb.gz" "$WEB/px.php?a=sb&arch=$arch" || { echo "下载失败：机器人那边没放统计版 sing-box（sb-stats-linux-$arch.gz），或网络不通"; rm -rf "$tmp"; return 1; }
+    if [ -n "$PX_PUB" ]; then
+        sig=$(grep -i '^x-px-sig:' "$tmp/h" | head -n1 | cut -d: -f2- | tr -d ' \r\n')
+        [ -n "$sig" ] || { echo "统计版 sing-box 没有签名，拒绝安装"; rm -rf "$tmp"; return 1; }
+        echo "$PX_PUB" | base64 -d > "$tmp/pub" 2>/dev/null; echo "$sig" | base64 -d > "$tmp/sig" 2>/dev/null
+        openssl dgst -sha256 -verify "$tmp/pub" -signature "$tmp/sig" "$tmp/sb.gz" >/dev/null 2>&1 || { echo "统计版 sing-box 签名校验失败，拒绝安装"; rm -rf "$tmp"; return 1; }
+    fi
+    gunzip -c "$tmp/sb.gz" > "$tmp/sb" 2>/dev/null && chmod 755 "$tmp/sb" || { echo "解压失败"; rm -rf "$tmp"; return 1; }
+    "$tmp/sb" version 2>/dev/null | grep -q with_v2ray_api || { echo "这个 sing-box 没带统计功能"; rm -rf "$tmp"; return 1; }
+    install -m 755 "$tmp/sb" "$AT_BIN"; rm -rf "$tmp"
+    echo "统计版 sing-box 已安装"
+}
+
+sb_need() {                # sb_need：按 STATS 决定要官方版还是统计版 sing-box
+    if [ "$STATS" = 1 ]; then at_stats_ok || at_install_stats; else at_bin_ok || at_install_bin; fi
+}
+
+sb_exp() {                 # sb_exp 协议 → 配置里 experimental 那一段（没开统计就什么都不输出）
+    local ids="" e id uu pw
+    if [ "$STATS" != 1 ]; then rm -f "$DIR/sbstat.$1"; return 0; fi
+    local IFS=','
+    for e in $USERS; do
+        IFS=: read -r id uu pw <<< "$e"
+        ids="$ids${ids:+, }\"$id\""
+    done
+    echo "$1" > "$DIR/sbstat.$1"
+    printf ', "experimental": {"v2ray_api": {"listen": "127.0.0.1:%s", "stats": {"enabled": true, "users": [%s]}}}' "$(sb_stat_port "$1")" "$ids"
+}
+
+# 读一次统计（gRPC QueryStats，pattern=user>>>，reset=true 读完清零）→ 输出「编号 字节数」。只用 curl 的 HTTP/2，不装 grpcurl
+sb_stat_read() {           # sb_stat_read 端口；curl 出错返回 1
+    local req="$DIR/sbq.bin" resp="$DIR/sbr.bin"
+    printf '\x00\x00\x00\x00\x0b\x0a\x07user>>>\x10\x01' > "$req"
+    curl -fsS -m 3 --http2-prior-knowledge -H 'content-type: application/grpc' -H 'te: trailers' --data-binary @"$req" -o "$resp" \
+        "http://127.0.0.1:$1/v2ray.core.app.stats.command.StatsService/QueryStats" 2>/dev/null || return 1
+    od -An -v -tu1 "$resp" | awk '
+        { for (i = 1; i <= NF; i++) b[n++] = $i }
+        END {
+            p = 5
+            while (p < n) {
+                if (b[p++] != 10) break
+                len = 0; sh = 0
+                while (1) { c = b[p++]; len += (c % 128) * (2 ^ sh); sh += 7; if (c < 128) break }
+                pe = p + len; name = ""; val = 0
+                while (p < pe) {
+                    t = b[p++]
+                    if (t == 10) { l = b[p++]; for (k = 0; k < l; k++) name = name sprintf("%c", b[p++]) }
+                    else if (t == 16) { v = 0; sh = 0; while (1) { c = b[p++]; v += (c % 128) * (2 ^ sh); sh += 7; if (c < 128) break } val = v }
+                    else break
+                }
+                p = pe
+                split(name, a, ">>>")
+                if (a[1] == "user" && a[2] != "" && val > 0) s[a[2]] += val
+            }
+            for (k in s) printf "%s %d\n", k, s[k]
+        }'
+    rm -f "$req" "$resp"
+    return 0
+}
+
+sb_stat_probe() {          # 装好后试读一次：读不通（curl 太旧不支持 HTTP/2 等）就报错，不然流量统计会悄悄失效
+    [ "$STATS" = 1 ] || return 0
+    sleep 1
+    sb_stat_read "$(sb_stat_port "$1")" >/dev/null || { echo "统计接口读取失败（节点的 curl 需要支持 HTTP/2，或统计端口被占用）"; return 1; }
+}
+
 sb_unit() {                # sb_unit 服务名 说明 配置文件：用共用的 sing-box 跑一个服务
     cat > "/etc/systemd/system/$1" <<EOF
 [Unit]
@@ -284,7 +458,7 @@ sb_bin_rm() {              # anytls / tuic / reality 都卸载了才删共用的
 
 job_anytls() {             # 需要 PORT PASS SNI
     pkg_install curl; pkg_install openssl; pkg_install tar
-    at_bin_ok || at_install_bin || return 1
+    sb_need || return 1
     mkdir -p "$AT_DIR"; chmod 700 "$AT_DIR"
     local crt="$AT_DIR/server.crt" key="$AT_DIR/server.key"
     if [ -n "$DOMAIN" ]; then get_cert "$DOMAIN" || return 1; crt="$CERT_CRT"; key="$CERT_KEY"
@@ -294,10 +468,10 @@ job_anytls() {             # 需要 PORT PASS SNI
   "log": {"level": "warn", "timestamp": true},
   "inbounds": [{
     "type": "anytls", "tag": "anytls-in", "listen": "::", "listen_port": $PORT,
-    "users": [{"name": "user", "password": "$PASS"}],
+    "users": [$(sb_users anytls)],
     "tls": {"enabled": true, "server_name": "$SNI", "certificate_path": "$crt", "key_path": "$key"}
   }],
-  "outbounds": [{"type": "direct", "tag": "direct"}]
+  "outbounds": [{"type": "direct", "tag": "direct"}]$(sb_exp anytls)
 }
 EOF
     local out
@@ -310,13 +484,14 @@ EOF
     systemctl restart "$AT_SVC"
     sleep 2
     if ! systemctl is-active --quiet "$AT_SVC"; then echo "AnyTLS 启动失败，日志："; journalctl -u "$AT_SVC" -n 15 --no-pager 2>&1 | tail -n 15; return 1; fi
+    sb_stat_probe anytls || return 1
     [ -n "$DOMAIN" ] || FP=$(cert_fp "$AT_DIR/server.crt")
     echo "AnyTLS 已运行：TCP $PORT${DOMAIN:+ · 域名证书 $DOMAIN}"
 }
 
 job_rm_anytls() {
     systemctl disable --now "$AT_SVC" >/dev/null 2>&1
-    rm -f /etc/systemd/system/$AT_SVC; rm -rf "$AT_DIR"
+    rm -f /etc/systemd/system/$AT_SVC "$DIR/sbstat.anytls"; rm -rf "$AT_DIR"
     sb_bin_rm
     systemctl daemon-reload >/dev/null 2>&1
     echo "AnyTLS 已卸载"
@@ -326,7 +501,7 @@ job_rm_anytls() {
 # 不需要域名和证书：借一个真实网站（SNI）的 TLS 握手伪装。私钥只留在节点上，公钥回报给小程序生成链接。
 job_reality() {            # 需要 PORT UUID SID SNI
     pkg_install curl; pkg_install tar
-    at_bin_ok || at_install_bin || return 1
+    sb_need || return 1
     mkdir -p "$RE_DIR"; chmod 700 "$RE_DIR"
     # 伪装网站必须从这台节点能连上、并支持 TLS 1.3，否则客户端握手会失败
     if ! curl -sS -o /dev/null --connect-timeout 8 -m 15 --tlsv1.3 "https://$SNI/" 2>"$RE_DIR/probe.err"; then
@@ -348,11 +523,11 @@ job_reality() {            # 需要 PORT UUID SID SNI
   "log": {"level": "warn", "timestamp": true},
   "inbounds": [{
     "type": "vless", "tag": "vless-in", "listen": "::", "listen_port": $PORT,
-    "users": [{"name": "user", "uuid": "$UUID", "flow": "xtls-rprx-vision"}],
+    "users": [$(sb_users reality)],
     "tls": {"enabled": true, "server_name": "$SNI",
       "reality": {"enabled": true, "handshake": {"server": "$SNI", "server_port": 443}, "private_key": "$priv", "short_id": ["$SID"]}}
   }],
-  "outbounds": [{"type": "direct", "tag": "direct"}]
+  "outbounds": [{"type": "direct", "tag": "direct"}]$(sb_exp reality)
 }
 EOF
     local out
@@ -365,13 +540,14 @@ EOF
     systemctl restart "$RE_SVC"
     sleep 2
     if ! systemctl is-active --quiet "$RE_SVC"; then echo "VLESS Reality 启动失败，日志："; journalctl -u "$RE_SVC" -n 15 --no-pager 2>&1 | tail -n 15; return 1; fi
+    sb_stat_probe reality || return 1
     PBK="$pub"
     echo "VLESS Reality 已运行：TCP $PORT · 伪装 $SNI"
 }
 
 job_rm_reality() {
     systemctl disable --now "$RE_SVC" >/dev/null 2>&1
-    rm -f /etc/systemd/system/$RE_SVC; rm -rf "$RE_DIR"
+    rm -f /etc/systemd/system/$RE_SVC "$DIR/sbstat.reality"; rm -rf "$RE_DIR"
     sb_bin_rm
     systemctl daemon-reload >/dev/null 2>&1
     echo "VLESS Reality 已卸载"
@@ -380,7 +556,7 @@ job_rm_reality() {
 # ---------------------------------------------------------------- tuic v5（和 anytls 共用同一个 sing-box）
 job_tuic() {               # 需要 PORT UUID PASS SNI
     pkg_install curl; pkg_install openssl; pkg_install tar
-    at_bin_ok || at_install_bin || return 1
+    sb_need || return 1
     mkdir -p "$TU_DIR"; chmod 700 "$TU_DIR"
     local crt="$TU_DIR/server.crt" key="$TU_DIR/server.key"
     if [ -n "$DOMAIN" ]; then get_cert "$DOMAIN" || return 1; crt="$CERT_CRT"; key="$CERT_KEY"
@@ -390,11 +566,11 @@ job_tuic() {               # 需要 PORT UUID PASS SNI
   "log": {"level": "warn", "timestamp": true},
   "inbounds": [{
     "type": "tuic", "tag": "tuic-in", "listen": "::", "listen_port": $PORT,
-    "users": [{"name": "user", "uuid": "$UUID", "password": "$PASS"}],
+    "users": [$(sb_users tuic)],
     "congestion_control": "bbr", "auth_timeout": "3s", "zero_rtt_handshake": false, "heartbeat": "10s",
     "tls": {"enabled": true, "server_name": "$SNI", "alpn": ["h3"], "certificate_path": "$crt", "key_path": "$key"}
   }],
-  "outbounds": [{"type": "direct", "tag": "direct"}]
+  "outbounds": [{"type": "direct", "tag": "direct"}]$(sb_exp tuic)
 }
 EOF
     local out
@@ -407,29 +583,128 @@ EOF
     systemctl restart "$TU_SVC"
     sleep 2
     if ! systemctl is-active --quiet "$TU_SVC"; then echo "TUIC 启动失败，日志："; journalctl -u "$TU_SVC" -n 15 --no-pager 2>&1 | tail -n 15; return 1; fi
+    sb_stat_probe tuic || return 1
     echo "TUIC 已运行：UDP $PORT · bbr${DOMAIN:+ · 域名证书 $DOMAIN}"
 }
 
 job_rm_tuic() {
     systemctl disable --now "$TU_SVC" >/dev/null 2>&1
-    rm -f /etc/systemd/system/$TU_SVC; rm -rf "$TU_DIR"
+    rm -f /etc/systemd/system/$TU_SVC "$DIR/sbstat.tuic"; rm -rf "$TU_DIR"
     sb_bin_rm
     systemctl daemon-reload >/dev/null 2>&1
     echo "TUIC 已卸载"
 }
 
 # ---------------------------------------------------------------- 任务分发（先校验再执行）
-OP=""; JID=""; PORT=""; PASS=""; OBFS=""; SNI=""; HOP=""; FP=""; DOMAIN=""; UUID=""; SID=""; PBK=""
+OP=""; JID=""; PORT=""; PASS=""; OBFS=""; SNI=""; HOP=""; FP=""; DOMAIN=""; UUID=""; SID=""; PBK=""; USERS=""; STATS=""
+
+# ---------------------------------------------------------------- 端口转发（内核 iptables，不装任何转发工具）
+fwd_script() {             # 规则在 $DIR/fwd.rules，每行：协议 本机端口 目标IP 目标端口；开机由 px-fwd.service 恢复
+    cat > "$DIR/fwd.sh" <<'EOF'
+#!/bin/bash
+# 用法：fwd.sh up|down
+R=/opt/px-agent/fwd.rules
+command -v iptables >/dev/null 2>&1 || exit 0
+del() {
+    iptables -t nat -D PREROUTING -j PXFWD_PRE 2>/dev/null
+    iptables -t nat -D POSTROUTING -j PXFWD_POST 2>/dev/null
+    iptables -D FORWARD -j PXFWD_FWD 2>/dev/null
+    local c
+    for c in "nat PXFWD_PRE" "nat PXFWD_POST" "filter PXFWD_FWD"; do
+        set -- $c
+        iptables -t "$1" -F "$2" 2>/dev/null; iptables -t "$1" -X "$2" 2>/dev/null
+    done
+}
+del
+[ "$1" = up ] || exit 0
+[ -s "$R" ] || exit 0
+iptables -t nat -N PXFWD_PRE; iptables -t nat -N PXFWD_POST; iptables -N PXFWD_FWD
+iptables -A PXFWD_FWD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+while read -r proto port ip tport; do
+    [ -n "$proto" ] || continue
+    iptables -t nat -A PXFWD_PRE -p "$proto" --dport "$port" -j DNAT --to-destination "$ip:$tport"
+    iptables -t nat -A PXFWD_POST -p "$proto" -d "$ip" --dport "$tport" -j MASQUERADE
+    iptables -A PXFWD_FWD -p "$proto" -d "$ip" --dport "$tport" -j ACCEPT
+done < "$R"
+iptables -t nat -I PREROUTING 1 -j PXFWD_PRE
+iptables -t nat -I POSTROUTING 1 -j PXFWD_POST
+iptables -I FORWARD 1 -j PXFWD_FWD
+exit 0
+EOF
+    chmod 755 "$DIR/fwd.sh"
+}
+
+fwd_off() {
+    [ -f "$DIR/fwd.sh" ] && bash "$DIR/fwd.sh" down
+    systemctl disable --now "$FWD_SVC" >/dev/null 2>&1
+    rm -f /etc/systemd/system/$FWD_SVC "$DIR/fwd.rules" /etc/sysctl.d/99-px-fwd.conf
+    systemctl daemon-reload >/dev/null 2>&1
+}
+
+job_fwd() {                # 需要 RULES：协议:本机端口:目标IP:目标端口，逗号分隔；"-" 表示清空
+    if [ "$RULES" = "-" ]; then fwd_off; echo "已清除全部端口转发"; return 0; fi
+    command -v iptables >/dev/null 2>&1 || pkg_install iptables || { echo "没有 iptables，无法做端口转发"; return 1; }
+    fwd_script
+    local item proto port ip tport n=0
+    : > "$DIR/fwd.rules.new"
+    local IFS=','
+    for item in $RULES; do
+        IFS=: read -r proto port ip tport <<< "$item"
+        echo "$proto $port $ip $tport" >> "$DIR/fwd.rules.new"
+        fw_open "$port" "$proto"
+        n=$((n + 1))
+    done
+    unset IFS
+    mv -f "$DIR/fwd.rules.new" "$DIR/fwd.rules"
+    printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/99-px-fwd.conf
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    cat > /etc/systemd/system/$FWD_SVC <<EOF
+[Unit]
+Description=Port forwarding (px-agent, kernel iptables)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash $DIR/fwd.sh up
+ExecStop=/bin/bash $DIR/fwd.sh down
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable "$FWD_SVC" >/dev/null 2>&1
+    systemctl restart "$FWD_SVC" || { echo "启动转发服务失败"; return 1; }
+    local got; got=$(iptables -t nat -S PXFWD_PRE 2>/dev/null | grep -c -- '-j DNAT')
+    [ "$got" -ge 1 ] || { echo "转发规则没有生效（iptables 里没有 DNAT 规则）"; return 1; }
+    echo "已生效 $got 条转发规则（内核 DNAT）"
+}
 
 valid_job() {
     [[ "$JID" =~ ^[A-Za-z0-9]{6,16}$ ]] || return 1
     case "$OP" in
+        fwd)
+            [ "$RULES" = "-" ] && return 0
+            local it pr po ip tp o
+            local IFS=','
+            for it in $RULES; do
+                IFS=: read -r pr po ip tp <<< "$it"
+                [[ "$pr" == tcp || "$pr" == udp ]] || return 1
+                [[ "$po" =~ ^[0-9]{1,5}$ ]] && [ "$po" -ge 1 ] && [ "$po" -le 65535 ] || return 1
+                [[ "$tp" =~ ^[0-9]{1,5}$ ]] && [ "$tp" -ge 1 ] && [ "$tp" -le 65535 ] || return 1
+                [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+                for o in 1 2 3 4; do [ "${BASH_REMATCH[$o]}" -le 255 ] || return 1; done
+            done
+            return 0 ;;
         update|restart_hy2|restart_anytls|restart_tuic|restart_reality|uninstall_agent|rm_hy2|rm_anytls|rm_tuic|rm_reality) return 0 ;;
         reality)
             [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || return 1
             [[ "$SNI" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,98}[A-Za-z0-9])?$ ]] && [[ "$SNI" == *.* ]] || return 1
             [[ "$UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
             [[ "$SID" =~ ^[0-9a-f]{8}$ ]] || return 1
+            [ -z "$STATS" ] || [ "$STATS" = 1 ] || return 1
+            valid_users || return 1
             return 0 ;;
         hy2|anytls|tuic)
             [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || return 1
@@ -439,6 +714,8 @@ valid_job() {
             [ -z "$HOP" ] || [[ "$HOP" =~ ^[0-9]{1,5}-[0-9]{1,5}$ ]] || return 1
             [ -z "$DOMAIN" ] || { [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,98}[A-Za-z0-9])?$ ]] && [[ "$DOMAIN" == *.* ]]; } || return 1
             [ "$OP" != tuic ] || [[ "$UUID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 1
+            [ -z "$STATS" ] || [ "$STATS" = 1 ] || return 1
+            valid_users || return 1
             return 0 ;;
     esac
     return 1
@@ -484,6 +761,7 @@ run_job() {
             restart_anytls) systemctl restart "$AT_SVC" && echo "已重启 anytls" ;;
             restart_tuic) systemctl restart "$TU_SVC" && echo "已重启 tuic" ;;
             restart_reality) systemctl restart "$RE_SVC" && echo "已重启 reality" ;;
+            fwd) job_fwd ;;
             update) self_update ;;
             uninstall_agent) echo "agent 即将卸载（hy2 / anytls / tuic / reality 不受影响）"; UNINSTALL=1 ;;
         esac
@@ -497,10 +775,26 @@ run_job() {
 }
 
 # ---------------------------------------------------------------- 主循环
+ip4_get() {                # 本机公网 IPv4（缓存 30 分钟；取不到记成 none，避免每次心跳都去等超时）。端口转发要用 IPv4 地址
+    local f="$DIR/ip4" now v u mt
+    now=$(date +%s); mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+    if [ -s "$f" ] && [ $((now - mt)) -lt 1800 ]; then cat "$f"; return; fi
+    v=""
+    for u in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
+        v=$(curl -4 -fsS -m 5 "$u" 2>/dev/null | tr -d ' \r\n')
+        [[ "$v" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && break
+        v=""
+    done
+    [ -n "$v" ] || v=none
+    echo "$v" > "$f"; echo "$v"
+}
+
 heartbeat() {
-    printf 'VER=%s\nHOST=%s\nOS=%s\nS_HY2=%s\nS_ANYTLS=%s\nS_TUIC=%s\nS_REALITY=%s\n' "$AGENT_VER" "$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')" \
-        "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" | tr -cd 'A-Za-z0-9._ ()/-')" "$(svc_state "$HY_SVC")" "$(svc_state "$AT_SVC")" "$(svc_state "$TU_SVC")" "$(svc_state "$RE_SVC")"
+    printf 'VER=%s\nHOST=%s\nOS=%s\nS_HY2=%s\nS_ANYTLS=%s\nS_TUIC=%s\nS_REALITY=%s\nS_FWD=%s\nIP4=%s\nARCH=%s\n' "$AGENT_VER" "$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')" \
+        "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" | tr -cd 'A-Za-z0-9._ ()/-')" "$(svc_state "$HY_SVC")" "$(svc_state "$AT_SVC")" "$(svc_state "$TU_SVC")" "$(svc_state "$RE_SVC")" "$(svc_state "$FWD_SVC")" "$(ip4_get)" "$(at_arch)"
     [ -s "$DIR/result.txt" ] && cat "$DIR/result.txt"
+    tr_collect; tr_line
+    return 0
 }
 
 agent_run() {
@@ -512,11 +806,12 @@ agent_run() {
         NEXT=$INTERVAL
         if resp=$(heartbeat | curl -fsS -m 25 -X POST -H "X-Px-Token: $TOKEN" --data-binary @- "$WEB/px.php" 2>/dev/null); then
             fails=0
-            OP=""; JID=""; PORT=""; PASS=""; OBFS=""; SNI=""; HOP=""; DOMAIN=""; UUID=""; SID=""
+            OP=""; JID=""; PORT=""; PASS=""; OBFS=""; SNI=""; HOP=""; DOMAIN=""; UUID=""; SID=""; RULES=""; USERS=""; STATS=""
             while IFS= read -r line; do
                 k=${line%%=*}; v=${line#*=}
                 case "$k" in
                     ACK) rm -f "$DIR/result.txt" ;;
+                    TRACK) rm -f "$DIR/tr.pend" ;;
                     NEXT) [[ "$v" =~ ^[0-9]{1,3}$ ]] && [ "$v" -ge 2 ] && [ "$v" -le 300 ] && NEXT=$v ;;
                     JOB) JID="$v" ;;
                     OP) OP="$v" ;;
@@ -528,6 +823,9 @@ agent_run() {
                     DOMAIN) DOMAIN="$v" ;;
                     UUID) UUID="$v" ;;
                     SID) SID="$v" ;;
+                    RULES) RULES="$v" ;;
+                    USERS) USERS="$v" ;;
+                    STATS) STATS="$v" ;;
                 esac
             done <<< "$resp"
             if [ -n "$JID" ] && [ -n "$OP" ]; then
@@ -535,6 +833,7 @@ agent_run() {
                 else printf 'JOB=%s\nRC=1\nFP=\nLOG=%s\n' "$JID" "$(echo "任务参数没有通过 agent 的校验，已拒绝执行" | b64)" > "$DIR/result.txt"; fi
                 # 立刻回报结果，不等下一轮
                 if resp=$(heartbeat | curl -fsS -m 25 -X POST -H "X-Px-Token: $TOKEN" --data-binary @- "$WEB/px.php" 2>/dev/null) && echo "$resp" | grep -q '^ACK='; then rm -f "$DIR/result.txt"; fi
+                echo "$resp" | grep -q '^TRACK=' && rm -f "$DIR/tr.pend"
                 if [ "$UNINSTALL" = 1 ]; then do_uninstall; exit 0; fi
                 if [ "${RESTART_AGENT:-0}" = 1 ]; then exit 0; fi          # systemd 的 Restart=always 会用新版本重新拉起
                 continue
