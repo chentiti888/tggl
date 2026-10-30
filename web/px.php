@@ -3,6 +3,7 @@
 //   POST px.php            agent 报到，头 X-Px-Token
 //   GET  px.php?s=订阅密钥  订阅内容（&f=clash|sb|b64 指定格式，默认按客户端自动识别）
 //   GET  px.php?a=sh        节点 agent 脚本（脚本放在机器人目录，带签名头 X-Px-Sig，节点更新时验签）
+//   GET  px.php?a=sb&arch=  统计版 sing-box（放在机器人目录，带签名头，节点装之前验签）
 declare(strict_types=1);
 header('Cache-Control: no-store');
 header('X-Content-Type-Options: nosniff');
@@ -36,11 +37,19 @@ if ($method === 'POST') {
     $url = $base . '/pub/sh';
     $body = '';
     $timeout = 15;
+} elseif ($method === 'GET' && ($_GET['a'] ?? '') === 'sb') {
+    $arch = (string)($_GET['arch'] ?? '');
+    if (!in_array($arch, ['amd64', 'arm64'], true)) fail(400, 'bad arch');
+    $url = $base . '/pub/sb?arch=' . $arch;
+    $body = '';
+    $timeout = 120;
 } elseif ($method === 'GET') {
     $s = (string)($_GET['s'] ?? '');
     if (!preg_match('/^[A-Za-z0-9]{16,64}$/', $s)) fail(403, 'bad token');
     $f = (string)($_GET['f'] ?? '');
-    $url = $base . '/pub/sub?s=' . rawurlencode($s) . ($f !== '' ? '&f=' . rawurlencode(substr($f, 0, 8)) : '');
+    $m = (string)($_GET['m'] ?? '');
+    if (!in_array($m, ['', 'direct', 'fwd', 'all'], true)) $m = '';
+    $url = $base . '/pub/sub?s=' . rawurlencode($s) . ($f !== '' ? '&f=' . rawurlencode(substr($f, 0, 8)) : '') . ($m !== '' ? '&m=' . $m : '');
     $body = '';
     $headers[] = 'X-Px-Ua: ' . substr(preg_replace('/[\r\n]/', '', (string)($_SERVER['HTTP_USER_AGENT'] ?? '')), 0, 200);
     $timeout = 10;
