@@ -117,6 +117,7 @@
   } catch (e) {}
 
   function openLink(url) {
+    if (!/^https?:\/\//i.test(String(url || '').trim())) return;      // 只打开 http(s) 链接，不执行 javascript: 之类
     if (tg && tg.openLink) tg.openLink(url); else window.open(url, '_blank', 'noopener');
   }
   function timeText(ts) {
@@ -148,16 +149,26 @@
   }
   // 下拉刷新期间追踪 API 请求，等页面数据请求结束后再开始收尾。
   var ptrRefreshTracking = false, ptrRefreshPending = 0, ptrRefreshLastDone = 0, ptrRefreshGeneration = 0;
+  // 小程序在后台放久了，回来后第一批请求常常卡在被系统掐掉的旧连接上，一直转圈：
+  // 回到前台后的 20 秒内，读数据的请求 6 秒没响应就放弃这次、换条新连接重发。
+  var hiddenAt = 0, resumeAt = 0;
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) hiddenAt = Date.now();
+    else if (hiddenAt && Date.now() - hiddenAt > 20000) resumeAt = Date.now();
+  });
   function api(action, params, tries) {
     tries = tries == null ? 2 : tries;
     // 会改数据 / 会开任务的请求不自动重发，免得重复提交
     var safe = !/_edit$|^job_start$|^job_cancel$/.test(action);
-    var httpSt = 0;
+    var httpSt = 0, ctl = null, cto = 0;
+    if (safe && tries > 0 && window.AbortController && Date.now() - resumeAt < 20000) { ctl = new AbortController(); cto = setTimeout(function () { ctl.abort(); }, 6000); }
     var request = fetch('api.php?a=' + encodeURIComponent(action), {
       method: 'POST',
       headers: authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify(params || {})
-    }).then(function (r) { if (cfChallenged(r)) return cfPass(); httpSt = r.status; return r.text(); }, function () {
+      body: JSON.stringify(params || {}),
+      signal: ctl ? ctl.signal : undefined
+    }).then(function (r) { clearTimeout(cto); if (cfChallenged(r)) return cfPass(); httpSt = r.status; return r.text(); }, function () {
+      clearTimeout(cto);
       // 手机网络抖动 / 连接被系统掐断时 fetch 会直接失败（Safari 显示 Load failed）：自动重试，实在不行再提示
       if (safe && tries > 0) return new Promise(function (res) { setTimeout(res, 700); }).then(function () { return api(action, params, tries - 1); }).then(function (d) { return { __data: d }; });
       throw new Error('网络不稳定，请检查网络后重试');
@@ -311,6 +322,7 @@
     return f;
   }
   var ICON_X = {
+    fwd: '<path d="M4 8h14M14 4l4 4-4 4M20 16H6M10 12l-4 4 4 4"/>',
     pxg: '<path d="M12 3.5l9 4.8-9 4.8-9-4.8z"/><path d="M3 12.6l9 4.8 9-4.8"/><path d="M3 16.9l9 4.6 9-4.6"/>',
     more: '<circle cx="5" cy="12" r="1.9"/><circle cx="12" cy="12" r="1.9"/><circle cx="19" cy="12" r="1.9"/>',
     go: '<path d="M9.5 6l6 6-6 6"/>'
@@ -2141,7 +2153,24 @@
       bg.appendChild(box); document.body.appendChild(bg);
     }
     function folderMenu(f) {
-      menuSheet(r2Name(f).replace(/\/$/, ''), [['路径', f, 1]], [['重命名', function () { renameItem('folder', f); }]]);
+      menuSheet(r2Name(f).replace(/\/$/, ''), [['路径', f, 1]], [['重命名', function () { renameItem('folder', f); }], ['删除', function () { deleteFolder(f); }, 'danger']]);
+    }
+    function deleteFolder(f) {
+      var label = r2Name(f).replace(/\/$/, '');
+      api(A_EDIT, { op: 'dir_info', bucket: name, key: f }).then(function (info) {
+        var left = info.count ? (info.count + (info.more ? '+' : '') + ' 个文件（约 ' + fmtBytes(info.size) + (info.more ? '，还有更多' : '') + '）') : '没有文件（空文件夹）';
+        confirmBox('删除文件夹', '「' + label + '」里有 ' + left + '，全部删除后无法恢复。', function () {
+          var total = 0;
+          function step(first) {
+            return api(A_EDIT, { op: 'del_dir', bucket: name, key: f, cont: first ? 0 : 1 }, 0).then(function (r) {
+              total += r.deleted || 0;
+              if (r.more && !r.deleted) throw new Error('删除没有进展，已停止（已删 ' + total + ' 个）');
+              return r.more ? step(false) : total;
+            });
+          }
+          return step(true).then(function (n) { toast('已删除（' + n + ' 个对象）'); return list(true); });
+        });
+      }, function (e) { toast(e.message, true); });
     }
     function fileMenu(f) {
       var pub = data.public_url ? data.public_url.replace(/\/$/, '') + '/' + f.key.split('/').map(encodeURIComponent).join('/') : null;
@@ -2550,6 +2579,7 @@
   // ============================================================ 远程服务器：用 SFTP 管理别的服务器上的文件（只有所有者能用）
   // 路由（都在「管理」标签页下）：ssh = 服务器列表；sshd:<服务器id>|<目录> = 浏览目录；sshf:<服务器id>|<文件> = 查看 / 编辑文件
   function sTab() { return cur.tab === 'tools' ? 'tools' : 'admin'; }
+  var ghAutoEdit = '';
   var sshAutoEdit = '';        // 从「⋯ → 编辑」进来的文件路径：打开文件页后直接进入编辑，保存 / 取消后回到目录
   function sshRoute(page, sub) {
     if (sub === 'ssh') return pageSshList(page);
@@ -2560,7 +2590,7 @@
   // ============================================================ 安装代理（节点 agent + 订阅）
   // 路由（工具标签页下）：px = 节点列表 + 订阅地址；pxn:<节点id> = 节点详情（安装 / 重装 / 卸载协议、导入链接）
   var PX_OP = { hy2: '安装 hy2', anytls: '安装 anytls', tuic: '安装 tuic', reality: '安装 reality', rm_hy2: '卸载 hy2', rm_anytls: '卸载 anytls', rm_tuic: '卸载 tuic', rm_reality: '卸载 reality',
-    restart_hy2: '重启 hy2', restart_anytls: '重启 anytls', restart_tuic: '重启 tuic', restart_reality: '重启 reality', update: '更新节点程序', uninstall_agent: '卸载节点程序' };
+    restart_hy2: '重启 hy2', restart_anytls: '重启 anytls', restart_tuic: '重启 tuic', restart_reality: '重启 reality', update: '更新节点程序', uninstall_agent: '卸载节点程序', fwd: '端口转发' };
   // 协议：[键, 名称, 未安装时的说明, 传输层, 默认端口]
   var PX_PROTOS = [['hy2', 'Hysteria2', 'UDP · 可选混淆 / 端口跳跃', 'UDP', '443'], ['anytls', 'AnyTLS', 'TCP · sing-box 内核', 'TCP', '8443'],
     ['tuic', 'TUIC', 'UDP · QUIC v5 · sing-box 内核', 'UDP', '8443'],
@@ -2572,20 +2602,165 @@
     return pageProxy(page);
   }
   function pxTile() {
-    var sub = el('span', { class: 'st-sub', text: '一行命令装节点 · hy2 / anytls / tuic / reality · 订阅地址' });
+    var sub = el('span', { class: 'st-sub', text: '一行命令装节点 · 订阅地址' });
     var ic = el('span', { class: 'st-ic breathe' }, icon('tools'));
     api('px', null, 0).then(function (d) {
       if (!d.nodes.length) return;
-      var up = d.nodes.filter(function (n) { return n.online; }).length;
-      sub.textContent = d.nodes.length + ' 个节点 · ' + up + ' 个在线 · hy2 / anytls / tuic / reality';
+      var up = d.nodes.filter(function (n) { return n.online; }).length, nr = d.nodes.filter(function (n) { return n.kind === 'relay'; }).length;
+      sub.textContent = (d.nodes.length - nr) + ' 个节点' + (nr ? ' · ' + nr + ' 台转发' : '') + ' · ' + up + ' 个在线';
       ic.classList.add(up === d.nodes.length ? 'on' : 'off');
     }, function () {});
     return el('button', { class: 'card srv-tile', onclick: function () { go('tools', 'px'); } },
       ic, el('span', { class: 'st-tx' }, el('b', { text: '安装代理' }), sub), goArrow());
   }
+  // 二维码：自带的小生成器（字节模式，纠错 L），内容太长就不显示二维码按钮
+  // 简易二维码生成：字节模式，纠错 L，版本 1–20（最多约 850 字节）。返回 {n, get(x,y)} 或 null
+  function qrMake(text) {
+    var T = [null, [26, 7, 1, 19, 0, 0], [44, 10, 1, 34, 0, 0], [70, 15, 1, 55, 0, 0], [100, 20, 1, 80, 0, 0], [134, 26, 1, 108, 0, 0], [172, 18, 2, 68, 0, 0], [196, 20, 2, 78, 0, 0], [242, 24, 2, 97, 0, 0], [292, 30, 2, 116, 0, 0], [346, 18, 2, 68, 2, 69], [404, 20, 4, 81, 0, 0], [466, 24, 2, 92, 2, 93], [532, 26, 4, 107, 0, 0], [581, 30, 3, 115, 1, 116], [655, 22, 5, 87, 1, 88], [733, 24, 5, 98, 1, 99], [815, 28, 1, 107, 5, 108], [901, 30, 5, 120, 1, 121], [991, 28, 3, 113, 4, 114], [1085, 28, 3, 107, 5, 108]];
+    var AP = [null, [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50], [6, 30, 54], [6, 32, 58], [6, 34, 62], [6, 26, 46, 66], [6, 26, 48, 70], [6, 26, 50, 74], [6, 30, 54, 78], [6, 30, 56, 82], [6, 30, 58, 86], [6, 34, 62, 90]];
+    var u = unescape(encodeURIComponent(text)), data = [], i, j, k;
+    for (i = 0; i < u.length; i++) data.push(u.charCodeAt(i));
+    var ver = 0, t;
+    for (i = 1; i < T.length; i++) {
+      t = T[i]; var cap = t[2] * t[3] + t[4] * t[5];
+      if (4 + (i < 10 ? 8 : 16) + 8 * data.length <= cap * 8) { ver = i; break; }
+    }
+    if (!ver) return null;
+    t = T[ver];
+    var nb = t[2] + t[4], dcw = t[2] * t[3] + t[4] * t[5], bits = [];
+    function put(v, n) { for (var q = n - 1; q >= 0; q--) bits.push((v >>> q) & 1); }
+    put(4, 4); put(data.length, ver < 10 ? 8 : 16); data.forEach(function (c) { put(c, 8); });
+    put(0, Math.min(4, dcw * 8 - bits.length)); while (bits.length % 8) bits.push(0);
+    var cw = []; for (i = 0; i < bits.length; i += 8) { var by = 0; for (j = 0; j < 8; j++) by = by * 2 + bits[i + j]; cw.push(by); }
+    for (i = 0; cw.length < dcw; i++) cw.push(i % 2 ? 0x11 : 0xEC);
+    // Reed-Solomon
+    var EXP = [], LOG = [], x = 1;
+    for (i = 0; i < 255; i++) { EXP[i] = x; LOG[x] = i; x <<= 1; if (x & 256) x ^= 0x11D; }
+    function mul(a, b) { return a && b ? EXP[(LOG[a] + LOG[b]) % 255] : 0; }
+    var ecn = t[1], gen = [1];
+    for (i = 0; i < ecn; i++) { var ng = []; for (j = 0; j <= gen.length; j++) ng[j] = (gen[j] || 0) ^ (j > 0 ? mul(gen[j - 1], EXP[i]) : 0); gen = ng; }
+    gen = gen.slice(1);
+    var blocks = [], ecs = [], pos = 0;
+    for (i = 0; i < nb; i++) {
+      var len = i < t[2] ? t[3] : t[5], d = cw.slice(pos, pos + len); pos += len;
+      var r = []; for (j = 0; j < ecn; j++) r.push(0);
+      d.forEach(function (c) { var f = c ^ r.shift(); r.push(0); for (var q = 0; q < ecn; q++) r[q] ^= mul(gen[q], f); });
+      blocks.push(d); ecs.push(r);
+    }
+    var out = [], maxd = t[5] || t[3];
+    for (i = 0; i < maxd; i++) blocks.forEach(function (b) { if (i < b.length) out.push(b[i]); });
+    for (i = 0; i < ecn; i++) ecs.forEach(function (b) { out.push(b[i]); });
+    var n = ver * 4 + 17, M = [], F = [];
+    for (i = 0; i < n; i++) { M.push([]); F.push([]); for (j = 0; j < n; j++) { M[i].push(false); F[i].push(false); } }
+    function set(xx, yy, v) { M[yy][xx] = v; F[yy][xx] = true; }
+    function finder(cx, cy) { for (var dy = -4; dy <= 4; dy++) for (var dx = -4; dx <= 4; dx++) { var xx = cx + dx, yy = cy + dy; if (xx < 0 || yy < 0 || xx >= n || yy >= n) continue; var m = Math.max(Math.abs(dx), Math.abs(dy)); set(xx, yy, m !== 4 && m !== 2); } }
+    finder(3, 3); finder(n - 4, 3); finder(3, n - 4);
+    var ap = AP[ver];
+    for (i = 0; i < ap.length; i++) for (j = 0; j < ap.length; j++) {
+      if ((i === 0 && j === 0) || (i === 0 && j === ap.length - 1) || (i === ap.length - 1 && j === 0)) continue;
+      for (var dy = -2; dy <= 2; dy++) for (var dx = -2; dx <= 2; dx++) set(ap[i] + dx, ap[j] + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+    }
+    for (i = 0; i < n; i++) { if (!F[6][i]) set(i, 6, i % 2 === 0); if (!F[i][6]) set(6, i, i % 2 === 0); }
+    for (i = 0; i < 9; i++) { F[8][i] = F[i][8] = true; }
+    for (i = 0; i < 8; i++) { F[8][n - 1 - i] = true; F[n - 1 - i][8] = true; }
+    set(8, n - 8, true);
+    if (ver >= 7) {
+      var rem = ver; for (i = 0; i < 12; i++) rem = (rem << 1) ^ ((rem >>> 11) * 0x1F25);
+      var vb = ver << 12 | rem;
+      for (i = 0; i < 18; i++) { var bit = ((vb >>> i) & 1) === 1, a = n - 11 + i % 3, bb = Math.floor(i / 3); set(a, bb, bit); set(bb, a, bit); }
+    }
+    // 数据位
+    var di = 0, total = out.length * 8, up = true, xx, yy;
+    var dm = [];
+    for (xx = n - 1; xx >= 1; xx -= 2) {
+      if (xx === 6) xx = 5;
+      for (i = 0; i < n; i++) {
+        yy = up ? n - 1 - i : i;
+        for (j = 0; j < 2; j++) {
+          var cx = xx - j;
+          if (F[yy][cx]) continue;
+          M[yy][cx] = di < total ? ((out[di >> 3] >>> (7 - (di & 7))) & 1) === 1 : false; di++;
+          dm.push([cx, yy]);
+        }
+      }
+      up = !up;
+    }
+    var MASK = [function (a, b) { return (a + b) % 2 === 0; }, function (a, b) { return b % 2 === 0; }, function (a, b) { return a % 3 === 0; }, function (a, b) { return (a + b) % 3 === 0; },
+      function (a, b) { return (Math.floor(a / 3) + Math.floor(b / 2)) % 2 === 0; }, function (a, b) { return a * b % 2 + a * b % 3 === 0; }, function (a, b) { return (a * b % 2 + a * b % 3) % 2 === 0; }, function (a, b) { return ((a + b) % 2 + a * b % 3) % 2 === 0; }];
+    function fmt(mask) {
+      var d = 1 << 3 | mask, r = d; for (var q = 0; q < 10; q++) r = (r << 1) ^ ((r >>> 9) * 0x537);   // 纠错 L = 01
+      var bitsv = ((d << 10) | r) ^ 0x5412, b = function (q) { return ((bitsv >>> q) & 1) === 1; };
+      for (var q = 0; q <= 5; q++) set(8, q, b(q));
+      set(8, 7, b(6)); set(8, 8, b(7)); set(7, 8, b(8));
+      for (q = 9; q < 15; q++) set(14 - q, 8, b(q));
+      for (q = 0; q < 8; q++) set(n - 1 - q, 8, b(q));
+      for (q = 8; q < 15; q++) set(8, n - 15 + q, b(q));
+      set(8, n - 8, true);
+    }
+    function penalty() {
+      var p = 0, a, b, c, run, same;
+      for (a = 0; a < n; a++) for (c = 0; c < 2; c++) {
+        run = 1;
+        for (b = 1; b < n; b++) { var v1 = c ? M[b][a] : M[a][b], v0 = c ? M[b - 1][a] : M[a][b - 1]; if (v1 === v0) { run++; if (run === 5) p += 3; else if (run > 5) p++; } else run = 1; }
+      }
+      for (a = 0; a < n - 1; a++) for (b = 0; b < n - 1; b++) if (M[a][b] === M[a][b + 1] && M[a][b] === M[a + 1][b] && M[a][b] === M[a + 1][b + 1]) p += 3;
+      var pat = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0], pat2 = pat.slice().reverse();
+      for (a = 0; a < n; a++) for (c = 0; c < 2; c++) for (b = 0; b + 11 <= n; b++) {
+        var m1 = true, m2 = true;
+        for (k = 0; k < 11; k++) { var v = c ? M[b + k][a] : M[a][b + k]; if ((v ? 1 : 0) !== pat[k]) m1 = false; if ((v ? 1 : 0) !== pat2[k]) m2 = false; }
+        if (m1) p += 40; if (m2) p += 40;
+      }
+      var dark = 0; for (a = 0; a < n; a++) for (b = 0; b < n; b++) if (M[a][b]) dark++;
+      p += Math.floor(Math.abs(dark * 20 - n * n * 10) / (n * n)) * 10;
+      return p;
+    }
+    var best = -1, bp = 1e9, mk;
+    for (mk = 0; mk < 8; mk++) {
+      dm.forEach(function (c) { M[c[1]][c[0]] = M[c[1]][c[0]] !== MASK[mk](c[0], c[1]); });
+      fmt(mk); var pp = penalty();
+      if (pp < bp) { bp = pp; best = mk; }
+      dm.forEach(function (c) { M[c[1]][c[0]] = M[c[1]][c[0]] !== MASK[mk](c[0], c[1]); });
+    }
+    dm.forEach(function (c) { M[c[1]][c[0]] = M[c[1]][c[0]] !== MASK[best](c[0], c[1]); });
+    fmt(best);
+    return { n: n, get: function (a, b) { return M[b][a]; } };
+  }
+
+  // 点一下直接唤起本机客户端导入（要装了对应客户端）。订阅地址（https）和单节点链接（tuic:// hy2:// 等）支持的客户端不一样
+  function qrOpenBtns(title, text) {
+    var enc = encodeURIComponent, isSub = /^https?:\/\//i.test(text), name = title || 'node', list = [];
+    if (isSub) {
+      list.push(['小火箭', 'shadowrocket://add/sub://' + btoa(text) + '?remark=' + enc(name)]);
+      list.push(['sing-box', 'sing-box://import-remote-profile?url=' + enc(text) + '#' + enc(name)]);
+      list.push(['Clash', 'clash://install-config?url=' + enc(text) + '&name=' + enc(name)]);
+      list.push(['Hiddify', 'hiddify://import/' + text + '#' + enc(name)]);
+    } else {
+      list.push(['小火箭', 'shadowrocket://add/' + text]);
+      list.push(['Hiddify', 'hiddify://import/' + text]);
+    }
+    return list.map(function (x) {
+      return el('button', { class: 'btn sm', text: x[0], onclick: function () { try { location.href = x[1]; } catch (e) { toast('打不开：没有装这个客户端？', true); } } });
+    });
+  }
+  function qrSheet(title, text) {
+    var q = qrMake(text);
+    if (!q) { toast('内容太长，生成不了二维码', true); return; }
+    var sc = Math.max(3, Math.floor(300 / (q.n + 8))), px = (q.n + 8) * sc, cv = el('canvas', { width: px, height: px, style: 'width:100%;max-width:300px;height:auto;display:block;margin:0 auto;border-radius:10px;image-rendering:pixelated' });
+    var g = cv.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, px, px); g.fillStyle = '#000';
+    for (var y = 0; y < q.n; y++) for (var x = 0; x < q.n; x++) if (q.get(x, y)) g.fillRect((x + 4) * sc, (y + 4) * sc, sc, sc);
+    var bg = el('div', { class: 'sheet-bg', onclick: function (e) { if (e.target === bg) bg.remove(); } });
+    bg.appendChild(el('div', { class: 'sheet' }, el('h2', { text: title }), cv,
+      el('div', { class: 'hint', style: 'text-align:center;margin:10px 0 0', text: '另一台设备扫码，或点下面直接在本机客户端里导入' }),
+      el('div', { class: 'gh-acts', style: 'justify-content:center;flex-wrap:wrap;margin-top:10px' }, qrOpenBtns(title, text)),
+      el('div', { class: 'acts' }, el('button', { class: 'btn', text: '关闭', onclick: function () { bg.remove(); } }))));
+    document.body.appendChild(bg);
+  }
   function pxCopyRow(tag, value, label) {
+    var hasQr = !!qrMake(value);
     return el('button', { class: 'gh-url', onclick: function () { copy(value); } },
-      el('span', { class: 'gh-ut', text: tag }), el('span', { class: 'mono gh-uv', text: label || value }), el('span', { class: 'gh-uc', text: '复制' }));
+      el('span', { class: 'gh-ut', text: tag }), el('span', { class: 'mono gh-uv', text: label || value }),
+      hasQr ? el('span', { class: 'gh-uc', style: 'padding:2px 6px', text: '二维码', onclick: function (e) { e.stopPropagation(); qrSheet(label || tag, value); } }) : null,
+      el('span', { class: 'gh-uc', text: '复制' }));
   }
   function pxCmdSheet(cmd, title) {
     var bg = el('div', { class: 'sheet-bg', onclick: function (e) { if (e.target === bg) bg.remove(); } },
@@ -2617,12 +2792,20 @@
     });
   }
   function pxSubCard(sub) {
-    var card = el('div', { class: 'card gh-clone' }), open = false;
-    function draw(s) {
+    var card = el('div', { class: 'card gh-clone' }), open = false, mode = 'direct';
+    function mu(u) { return mode === 'direct' ? u : u + '&m=' + mode; }
+    function draw(s0) {
+      var s = Object.assign({}, s0, { auto: mu(s0.auto), clash: mu(s0.clash), singbox: mu(s0.singbox), links: mu(s0.links) });
       clear(card);
-      card.appendChild(el('h3', { class: 'h3i nobar sub-h' + (open ? '' : ' closed'), onclick: function () { open = !open; draw(s); } },
+      card.appendChild(el('h3', { class: 'h3i nobar sub-h' + (open ? '' : ' closed'), onclick: function () { open = !open; draw(s0); } },
         icon('link'), el('span', { text: '订阅地址' }), el('span', { class: 'sp' }), el('span', { class: 'go-ar grp-arr' }, icon('go'))));
       if (!open) return;
+      var seg = el('div', { class: 'seg', style: 'margin:4px 0 10px' });
+      [['direct', '直连'], ['fwd', '转发'], ['all', '全部']].forEach(function (m) {
+        seg.appendChild(el('button', { class: mode === m[0] ? 'on' : '', text: m[1], onclick: function () { mode = m[0]; draw(s0); } }));
+      });
+      card.appendChild(seg);
+      card.appendChild(el('div', { class: 'hint', style: 'margin:-4px 0 8px', text: mode === 'direct' ? '直连：每个节点的原地址（原来的订阅，不变）。' : mode === 'fwd' ? '转发：只含中转线路（地址是中转机）。要先在中转机上添加转发并选好落地节点。' : '全部：直连和转发的节点放在同一个订阅里。' }));
       card.appendChild(pxCopyRow('自动', s.auto));
       card.appendChild(pxCopyRow('Clash', s.clash));
       card.appendChild(pxCopyRow('sing-box', s.singbox));
@@ -2645,11 +2828,160 @@
     draw(sub);
     return card;
   }
+  // ------------------------------------------------------------ 分享线路：给朋友一条独立订阅，限到期时间 / 流量
+  var GB = 1073741824, pxShareSb = [], pxShareRules = [];
+  function pxDateStr(ts) {
+    if (!ts) return '';
+    var d = new Date(ts * 1000), z = function (n) { return ('0' + n).slice(-2); };
+    return d.getFullYear() + '-' + z(d.getMonth() + 1) + '-' + z(d.getDate());
+  }
+  function pxDateTs(v) {
+    v = (v || '').trim();
+    if (!v) return 0;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return -1;
+    var t = new Date(v + 'T23:59:59').getTime();
+    return isNaN(t) ? -1 : Math.floor(t / 1000);
+  }
+  function pxShareStateText(s) { return s.state === 'ok' ? '正常' : s.state === 'off' ? '已停用' : s.state === 'expired' ? '已到期' : '流量用完'; }
+  function pxShareReady(s) {
+    var tot = 0, live = 0;
+    s.nodes.forEach(function (n) { if (n.protos.length) { tot++; if (n.live.length >= n.protos.length) live++; } });
+    return [live, tot];
+  }
+  function pxShareSheet(lands, s, done) {
+    var fields = [
+      { key: 'name', label: '名称（朋友的称呼，只有你看得到）', value: s ? s.name : '', ph: '比如：小王' },
+      { key: 'date', label: '到期日期（格式 2026-12-31；留空 = 永久）', value: s ? pxDateStr(s.exp) : pxDateStr(Date.now() / 1000 + 30 * 86400), ph: '2026-12-31' },
+      { key: 'gb', label: '流量上限（GB；留空 = 不限）', value: s && s.limit ? String(Math.round(s.limit / GB * 100) / 100) : '', ph: '比如：100' },
+      { key: 'scope', label: '线路范围（以后新加的节点、转发也自动包含）', value: s ? s.scope : 'all',
+        options: [['all', '全部（直连 + 入口）'], ['direct', '只要直连（落地节点）'], ['relay', '只要入口（转发）'], ['pick', '指定线路…']] }
+    ];
+    var lines = [];
+    lands.forEach(function (n) { lines.push(['d:' + n.id, '直连：' + n.name]); });
+    pxShareRules.forEach(function (r) { lines.push(['r:' + r.rid, '入口：' + r.name]); });
+    var picked = [];
+    if (s && s.scope === 'pick') { s.dn.forEach(function (x) { picked.push('d:' + x); }); s.rv.forEach(function (x) { picked.push('r:' + x); }); }
+    var pickBox = el('div', { class: 'f', style: 'display:none' }), chips = el('div', { style: 'margin:6px 0' });
+    var addSel = el('select', { class: 'input' });
+    function pickDraw() {
+      clear(chips);
+      if (!picked.length) chips.appendChild(el('div', { class: 'hint', text: '还没选线路：从上面的下拉里选一条加进来。' }));
+      picked.forEach(function (k) {
+        var ln = lines.filter(function (x) { return x[0] === k; })[0];
+        chips.appendChild(el('button', { class: 'btn sm', style: 'margin:3px 6px 3px 0;text-align:left', text: (ln ? ln[1] : k) + '  ✕', onclick: function () { picked.splice(picked.indexOf(k), 1); pickDraw(); } }));
+      });
+      clear(addSel); addSel.appendChild(el('option', { value: '', text: '＋ 添加一条线路…' }));
+      lines.forEach(function (x) { if (picked.indexOf(x[0]) < 0) addSel.appendChild(el('option', { value: x[0], text: x[1] })); });
+    }
+    addSel.addEventListener('change', function () { if (addSel.value) { picked.push(addSel.value); pickDraw(); } });
+    pickBox.appendChild(addSel); pickBox.appendChild(chips); pickDraw();
+    if (s) fields.push({ key: 'reset', check: '已用流量清零（续期时用）', value: false });
+    var bgSheet = sheet(s ? '编辑分享' : '新建分享', fields, s ? '保存' : '创建', function (v) {
+      var exp = pxDateTs(v.date), gb = String(v.gb || '').trim();
+      if (exp < 0) return Promise.reject(new Error('到期日期格式不对，比如 2026-12-31'));
+      if (gb && !(Number(gb) > 0)) return Promise.reject(new Error('流量上限填数字，单位 GB'));
+      var dn = [], rids = [];
+      picked.forEach(function (k) { (k.charAt(0) === 'd' ? dn : rids).push(k.slice(2)); });
+      if (v.scope === 'pick' && !picked.length) return Promise.reject(new Error('指定线路：至少选一条'));
+      var p = { op: s ? 'edit' : 'add', name: v.name, exp: exp, limit_gb: gb ? Number(gb) : 0, scope: v.scope, dnodes: dn, rids: rids };
+      if (s) { p.id = s.id; p.reset_used = !!v.reset; }
+      return api('px_share', p, 0).then(function (r) { toast(s ? '已保存' : '已创建'); done(r); });
+    }, el('div', { class: 'hint', style: 'margin:-2px 0 8px', text: (pxShareSb.length ? '设了流量上限：hy2 自带统计，一定可以；anytls / tuic / reality 要节点程序是最新版（v14），机器人目录里放了统计版 sing-box，才会发这几个协议（没满足的节点只发 hy2）。' : '设了流量上限的分享只会发 hy2 节点（只有 hy2 能按人统计流量）；想让 anytls / tuic / reality 也限流量，要在机器人目录放统计版 sing-box。') + '只限到期时间的，所有协议都能用。到期、用完或停用后，账号会自动从节点上移除。' }));
+    var scSel = bgSheet.querySelector('select');
+    scSel.parentNode.insertAdjacentElement('afterend', pickBox);
+    function pickSync() { pickBox.style.display = scSel.value === 'pick' ? '' : 'none'; }
+    scSel.addEventListener('change', pickSync); pickSync();
+  }
+  function pxShareMenu(s, lands, reload) {
+    var bg = el('div', { class: 'sheet-bg', onclick: function (e) { if (e.target === bg) bg.remove(); } });
+    var u = s.urls, srUrl = 'shadowrocket://add/sub://' + btoa(u.links) + '?remark=' + encodeURIComponent(s.name);
+    function item(t, fn, cls) { return el('button', { class: 'btn block ' + (cls || ''), style: 'margin:6px 0', text: t, onclick: function () { bg.remove(); fn(); } }); }
+    var sb = el('div', { class: 'sheet' }, el('h2', { text: s.name + ' · ' + pxShareStateText(s) }),
+      el('div', { class: 'hint', style: 'margin:0 0 8px', text: (s.limit ? '已用 ' + fmtBytes(s.used) + ' / ' + fmtBytes(s.limit) : '已用 ' + fmtBytes(s.used) + '（不限流量）') + ' · ' + (s.exp ? '到期 ' + pxDateStr(s.exp) : '永久有效') }));
+    sb.appendChild(pxCopyRow('自动', u.auto));
+    sb.appendChild(pxCopyRow('Clash', u.clash));
+    sb.appendChild(pxCopyRow('sing-box', u.singbox));
+    sb.appendChild(pxCopyRow('小火箭', u.links));
+    sb.appendChild(el('button', { class: 'btn sm block', style: 'margin-top:8px', text: '用小火箭打开', onclick: function () { location.href = srUrl; } }));
+    sb.appendChild(el('div', { class: 'hint', style: 'margin:6px 0 0', text: '包含：' + (s.scope === 'all' ? '全部（直连 + 入口）' : s.scope === 'direct' ? '只有直连' : s.scope === 'relay' ? '只有入口' : '指定：直连 ' + s.dn.length + ' 条 · 入口 ' + s.rv.length + ' 条') }));
+    var ns = el('div', { style: 'margin:12px 0 4px' }, el('div', { class: 'hint', style: 'margin:0 0 4px', text: '节点状态' }));
+    if (!s.nodes.length) ns.appendChild(el('div', { class: 'hint', text: '没有可用节点：选中的节点还没装协议。' }));
+    s.nodes.forEach(function (n) {
+      var t;
+      if (!n.protos.length) t = '没有可用协议（设了流量上限：这台没装 hy2' + (n.stats ? '' : '，anytls / tuic / reality 也没有统计版') + '）';
+      else if (s.state !== 'ok') t = '账号已移除（' + pxShareStateText(s) + '）';
+      else if (n.old) t = '节点程序太旧，先在节点页更新';
+      else if (n.live.length >= n.protos.length) t = '已就绪 · ' + n.protos.join(' / ') + (s.limit ? ' · 用了 ' + fmtBytes(n.used) : '') + (s.limit && !n.stats ? ' · 只有 hy2 限流量' : '');
+      else t = n.online ? '同步中…' : '节点离线，上线后自动同步';
+      ns.appendChild(el('div', { class: 'hint', style: 'margin:2px 0;color:var(--text)', text: n.name + '：' + t }));
+    });
+    sb.appendChild(ns);
+    sb.appendChild(item('编辑', function () { pxShareSheet(lands, s, reload); }));
+    sb.appendChild(item(s.on ? '停用' : '启用', function () { api('px_share', { op: 'toggle', id: s.id }, 0).then(function (r) { toast(s.on ? '已停用' : '已启用'); reload(r); }, function (e) { toast(e.message, true); }); }));
+    sb.appendChild(item('重置链接和账号', function () {
+      confirmBox('重置链接和账号', '旧的订阅链接和账号立刻失效，要把新链接重新发给对方。', function () { return api('px_share', { op: 'reset', id: s.id }, 0).then(function (r) { toast('已重置'); reload(r); }); });
+    }));
+    sb.appendChild(item('删除', function () {
+      confirmBox('删除分享', '删除「' + s.name + '」？对方的订阅马上失效，账号会从节点上移除。', function () { return api('px_share', { op: 'del', id: s.id }, 0).then(function (r) { toast('已删除'); reload(r); }); });
+    }, 'danger'));
+    sb.appendChild(el('div', { class: 'acts' }, el('button', { class: 'btn', text: '关闭', onclick: function () { bg.remove(); } })));
+    bg.appendChild(sb);
+    document.body.appendChild(bg);
+  }
+  function pxShareList(wrap, data, lands) {
+    pxShareSb = data.sb || []; pxShareRules = data.rules || [];
+    function reload(r) { if (r && r.shares) { data.shares = r.shares; data.sb = r.sb; data.rules = r.rules; pxShareList(wrap, data, lands); } else pxShareLoad(wrap, lands); }
+    clear(wrap);
+    wrap.appendChild(el('div', { class: 'gh-acts' }, el('button', { class: 'btn primary', text: '＋ 新建分享', onclick: function () {
+      if (!lands.length) { toast('还没有落地节点', true); return; }
+      pxShareSheet(lands, null, reload);
+    } })));
+    if (!data.shares.length) { wrap.appendChild(el('div', { class: 'hint', style: 'margin:12px 0', text: '给朋友用节点：新建一个分享，设好到期日期和流量上限，把生成的订阅链接发给他。每个分享的账号独立，到期、用完或停用后自动失效，不影响你自己和别人。' })); return; }
+    var box = el('div', { class: 'card gh-card' });
+    data.shares.forEach(function (s) {
+      var rd = pxShareReady(s), sub = [];
+      sub.push(s.limit ? fmtBytes(s.used) + ' / ' + fmtBytes(s.limit) : '已用 ' + fmtBytes(s.used));
+      sub.push(s.exp ? '到期 ' + pxDateStr(s.exp) : '永久');
+      if (s.state === 'ok') sub.push(rd[1] ? (rd[0] >= rd[1] ? '节点就绪' : '同步中 ' + rd[0] + '/' + rd[1]) : '无可用节点');
+      var bad = s.state !== 'ok', pct = s.limit ? Math.min(100, Math.round(s.used / s.limit * 100)) : 0;
+      box.appendChild(el('button', { class: 'gh-row', onclick: function () { pxShareMenu(s, lands, reload); } },
+        el('span', { class: 'gh-ri ssh-st ' + (bad ? 'off' : 'on') }, icon('usr')),
+        el('span', { class: 'gh-rt' }, el('b', { text: s.name }), el('small', {}, bad ? el('span', { style: 'color:var(--bad);font-weight:600', text: pxShareStateText(s) + ' · ' }) : null, document.createTextNode(sub.join(' · ')))),
+        goArrow()));
+      if (s.limit) box.appendChild(el('div', { style: 'height:3px;margin:-2px 14px 10px;border-radius:2px;background:var(--line);overflow:hidden' },
+        el('div', { style: 'height:100%;width:' + pct + '%;background:' + (pct >= 90 ? 'var(--bad)' : pct >= 70 ? 'var(--warn)' : 'var(--ok)') })));
+    });
+    wrap.appendChild(box);
+  }
+  function pxShareLoad(wrap, lands) {
+    clear(wrap); wrap.appendChild(skeleton(2));
+    api('px_share', { op: 'list' }, 0).then(function (r) { pxShareList(wrap, r, lands); }, function (e) { clear(wrap).appendChild(failBox(e.message, function () { pxShareLoad(wrap, lands); })); });
+  }
   function pageProxy(page) {
     page.appendChild(top('安装代理', true));
     var acts = el('div', { class: 'gh-acts' }), subBox = el('div'), card = el('div', { class: 'card gh-card' }, skeleton(2)), nodesBox = el('div');
-    page.appendChild(acts); page.appendChild(card); page.appendChild(nodesBox); page.appendChild(subBox);
+    var landWrap = el('div'), relayWrap = el('div'), shareWrap = el('div'), tabBtns = [], shareLoaded = false, shareLands = [];
+    var seg = el('div', { class: 'seg', style: 'margin:0 0 12px' });
+    function showTab(t) {
+      pxTabMem = t;
+      landWrap.style.display = t === 'land' ? '' : 'none'; relayWrap.style.display = t === 'relay' ? '' : 'none'; shareWrap.style.display = t === 'share' ? '' : 'none';
+      if (t === 'share' && !shareLoaded && pxShareReadyFlag) { shareLoaded = true; pxShareLoad(shareWrap, shareLands); }
+      tabBtns.forEach(function (b) { b.b.className = b.k === t ? 'on' : ''; });
+    }
+    [['land', '落地节点'], ['relay', '入口节点'], ['share', '专用分享']].forEach(function (x) {
+      var b = el('button', { text: x[1], onclick: function () { showTab(x[0]); } }); tabBtns.push({ k: x[0], b: b, t: x[1] }); seg.appendChild(b);
+    });
+    page.appendChild(seg);
+    landWrap.appendChild(acts); landWrap.appendChild(card); landWrap.appendChild(nodesBox); landWrap.appendChild(subBox);
+    page.appendChild(landWrap); page.appendChild(relayWrap); page.appendChild(shareWrap);
+    var pxShareReadyFlag = false;
+    showTab(pxTabMem);
     api('px').then(function (d) {
+      var nl = d.nodes.filter(function (n) { return n.kind !== 'relay'; }).length;
+      tabBtns[0].b.textContent = tabBtns[0].t + (nl ? ' ' + nl : ''); tabBtns[1].b.textContent = tabBtns[1].t + (d.nodes.length - nl ? ' ' + (d.nodes.length - nl) : '');
+      pxRelayList(relayWrap, d);
+      shareLands = d.nodes.filter(function (n) { return n.kind !== 'relay'; }); pxShareReadyFlag = !!d.web;
+      if (pxTabMem === 'share' && d.web) { shareLoaded = true; pxShareLoad(shareWrap, shareLands); }
       clear(card);
       function domainSheet() {
         sheet('设置域名', [{ key: 'url', label: '订阅 / 安装用的域名（https:// 开头；留空 = 用默认）', value: d.custom || '', ph: 'https://sub.example.com' }], '保存', function (v) {
@@ -2661,19 +2993,21 @@
       }
       if (!d.web) {
         acts.appendChild(el('button', { class: 'btn primary', text: '设置域名', onclick: domainSheet }));
+        shareWrap.appendChild(el('div', { class: 'hint', style: 'margin:12px 0', text: '先在「落地节点」页设置域名，再来新建分享。' }));
         card.remove(); acts.appendChild(el('div', { class: 'hint', text: '先设置一个域名（https:// 开头），安装命令和订阅地址都会用它。可以用单独的域名，不必和小程序同域。' }));
         return;
       }
-      acts.appendChild(el('button', { class: 'btn primary', text: '＋ 添加节点', onclick: function () {
-        sheet('添加节点', [{ key: 'name', label: '名称（随便起）', value: '', ph: '比如：东京 1' }].concat(d.groups.length ? [{ key: 'group', label: '分组', options: pxGroupOpts(d), value: '' }] : []), '生成安装命令', function (v) {
+      acts.appendChild(el('button', { class: 'btn primary', text: '＋ 添加落地节点', onclick: function () {
+        sheet('添加落地节点', [{ key: 'name', label: '名称（随便起）', value: '', ph: '比如：东京 1' }].concat(d.groups.length ? [{ key: 'group', label: '分组', options: pxGroupOpts(d), value: '' }] : []), '生成安装命令', function (v) {
           return api('px_node_edit', { op: 'add', name: v.name, group: v.group || '' }).then(function (n) { pxCmdSheet(n.cmd, '在节点服务器上执行'); go('tools', 'pxn:' + n.id); });
         });
       } }));
       acts.appendChild(el('button', { class: 'btn', text: '分组', onclick: function () { pxGroupsMenu(d); } }));
-      if (!d.nodes.length) card.appendChild(el('div', { class: 'hint', style: 'margin:8px 0', text: '还没有节点。点「添加节点」得到一行命令，到节点服务器上执行即可。' }));
-      if (d.nodes.length) {
+      var lands = d.nodes.filter(function (n) { return n.kind !== 'relay'; });
+      if (!lands.length) card.appendChild(el('div', { class: 'hint', style: 'margin:8px 0', text: '还没有节点。点「添加落地节点」得到一行命令，到节点服务器上执行即可。' }));
+      if (lands.length) {
         card.remove();
-        pxGroupList(nodesBox, d, function (n) {
+        pxGroupList(nodesBox, { nodes: lands, groups: d.groups }, function (n) {
           var tags = [];
           if (n.hy2) tags.push('hy2' + (n.hy2.hop ? '·跳跃' : '') + (n.hy2.obfs ? '·混淆' : ''));
           if (n.anytls) tags.push('anytls');
@@ -2689,6 +3023,29 @@
       subBox.appendChild(el('button', { class: 'gh-url px-dom', onclick: domainSheet },
         el('span', { class: 'gh-ut', text: '域名' }), el('span', { class: 'mono gh-uv', text: d.domain }), el('span', { class: 'gh-uc', text: '修改' })));
     }).catch(function (e) { clear(card).appendChild(failBox(e.message, function () { go(cur.tab, cur.sub, true); })); });
+  }
+
+  function pxAddRelay(d) {
+    sheet('添加入口节点', [{ key: 'name', label: '名称（随便起）', value: '', ph: '比如：东京转发 1' }].concat(d.groups.length ? [{ key: 'group', label: '分组', options: pxGroupOpts(d), value: '' }] : []), '生成安装命令', function (v) {
+      return api('px_node_edit', { op: 'add', kind: 'relay', name: v.name, group: v.group || '' }).then(function (n) { pxCmdSheet(n.cmd, '在入口节点上执行'); go('tools', 'pxn:' + n.id); });
+    }, el('div', { class: 'hint', style: 'margin:-2px 0 8px', text: '入口节点只做端口转发（内核 iptables），不装 hy2 / tuic 等协议。装好后进去添加转发规则即可。' }));
+  }
+  var pxTabMem = 'land';
+  function pxRelayList(wrap, d) {
+    var acts = el('div', { class: 'gh-acts' }, el('button', { class: 'btn primary', text: '＋ 添加入口节点', onclick: function () { pxAddRelay(d); } }));
+    wrap.appendChild(acts);
+    var relays = d.nodes.filter(function (n) { return n.kind === 'relay'; });
+    if (!relays.length) { wrap.appendChild(el('div', { class: 'hint', style: 'margin:12px 0', text: '还没有入口节点。点「添加入口节点」得到一行命令，到中转服务器上执行；之前已经加过转发规则的节点会自动出现在这里。入口节点不参与上面的节点分组。' })); return; }
+    var box = el('div', { class: 'card gh-card' });
+    relays.forEach(function (n) {
+      var nr = ((n.fwd && n.fwd.rules) || []).length;
+      box.appendChild(el('button', { class: 'gh-row', onclick: function () { go('tools', 'pxn:' + n.id); } },
+        el('span', { class: 'gh-ri ssh-st ' + (n.online ? 'on' : 'off') }, icon('fwd')),
+        el('span', { class: 'gh-rt' }, el('b', { text: n.name }), el('small', {}, !n.online && n.seen ? el('span', { style: 'color:var(--bad);font-weight:600', text: '离线 · ' }) : null,
+          document.createTextNode((n.addr || n.ip || '等待上线') + ' · ' + (nr ? nr + ' 条转发' : '还没有转发')))),
+        goArrow()));
+    });
+    wrap.appendChild(box);
   }
 
   function pxSvcText(p) {
@@ -2716,6 +3073,108 @@
       if (proto === 'hy2') { p.obfs = v.obfs; p.hop = v.hop; p.hop_range = v.hop_range; }
       return api('px_install', p).then(function () { toast('任务已下发'); onDone(); });
     }, el('div', { class: 'hint', style: 'margin:-2px 0 8px', text: re ? '不需要域名和证书。节点会自动生成密钥，客户端直接用导入链接 / 订阅即可（客户端要支持 Reality：v2rayN、Shadowrocket、NekoBox、Hiddify、Clash Meta、sing-box 都可以）。端口建议用 443；伪装网站换成别的也行，只要它支持 TLS 1.3。' : '不填域名 = 自签证书，客户端要开「允许不安全」。填域名 = 用 Cloudflare 自动建灰云解析（必须是没用过的新子域名，不能是订阅 / 小程序在用的域名），节点用 80 端口向 Let\'s Encrypt 申请正式证书（节点的 80 端口要空闲，云安全组要放行 TCP 80），客户端不用开允许不安全。' }));
+  }
+  // 端口转发：节点上用内核 iptables DNAT，不装转发工具；规则存在机器人里，每次改动整套下发
+  var FWD_PROTO = { tcp: 'TCP', udp: 'UDP', both: 'TCP+UDP' };
+  function pxFwdSheet(n, r, done) {
+    api('px', null, 0).then(function (d) {
+      var opts = [['', '手动填写目标（不生成导入链接）']];
+      d.nodes.forEach(function (x) {
+        if (x.id === n.id) return;
+        PX_PROTOS.forEach(function (pr) {
+          var c = x[pr[0]];
+          if (c && c.port) opts.push([x.id + '|' + pr[0], x.name + ' · ' + pr[1] + ' ' + c.port]);
+        });
+      });
+      var land = r && r.land ? r.land.n + '|' + r.land.t : '';
+      var bg = sheet(r ? '编辑转发' : '添加转发', [
+        { key: 'land', label: '落地节点（选了就自动填目标地址、端口、协议，并生成导入链接 / 订阅）', options: opts, value: land },
+        { key: 'port', label: '本机监听端口（别人连这台机器的这个端口）', value: r ? String(r.port) : '', ph: '如 8443' },
+        { key: 'to', label: '目标地址（没选落地节点时填：落地机的 IPv4 或域名）', value: r && !r.land ? r.to : '', ph: '如 1.2.3.4' },
+        { key: 'tport', label: '目标端口（没选落地节点时填）', value: r && !r.land ? String(r.tport) : '', ph: '如 443' },
+        { key: 'proto', label: '协议（没选落地节点时选）', options: [['both', 'TCP + UDP'], ['tcp', '仅 TCP'], ['udp', '仅 UDP']], value: r ? r.proto : 'both' },
+        { key: 'note', label: '备注（可选）', value: r ? r.note || '' : '', ph: '如 美国落地' }
+      ], r ? '保存' : '添加', function (v) {
+        var p = { id: n.id, op: r ? 'edit' : 'add', land: v.land, port: v.port, to: v.to, tport: v.tport, proto: v.proto, note: v.note };
+        if (r) p.rid = r.id;
+        return api('px_fwd', p).then(function () { toast('任务已下发'); done(); });
+      }, el('div', { class: 'hint', style: 'margin:-2px 0 8px', text: '由内核直接转发，不跑额外进程。落地机的防火墙 / 云安全组要放行中转机；本机的云安全组也要放行监听端口。选了落地节点，转发好后这个节点页会出现「转发导入链接」，订阅也能选「转发」。' }));
+      // 选了落地节点：目标地址 / 目标端口 / 协议自动带出（灰色，不用填）；本机监听端口留空时给一个没被占用的建议值
+      var ctl = bg.querySelectorAll('.f input.input, .f select');
+      var landSel = ctl[0], portIn = ctl[1], toIn = ctl[2], tportIn = ctl[3], protoSel = ctl[4];
+      var mine = d.nodes.filter(function (x) { return x.id === n.id; })[0] || n;
+      var used = {}, lastAuto = '';
+      PX_PROTOS.forEach(function (pr) { var c = mine[pr[0]]; if (c && c.port) used[c.port] = 1; });
+      ((n.fwd && n.fwd.rules) || []).forEach(function (x) { if (!r || x.id !== r.id) used[x.port] = 1; });
+      function syncLand() {
+        var v = landSel.value, auto = !!v;
+        [toIn, tportIn, protoSel].forEach(function (c) { c.disabled = auto; c.style.opacity = auto ? '.55' : ''; });
+        if (!auto) return;
+        var m = v.split('|'), x = d.nodes.filter(function (y) { return y.id === m[0]; })[0], c = x && x[m[1]];
+        if (!x || !c) return;
+        var a4 = x.addr && x.addr.indexOf(':') < 0 ? x.addr : (x.ip4 || (x.ip && x.ip.indexOf(':') < 0 ? x.ip : ''));
+        toIn.value = a4 || '（没有 IPv4 地址，先在落地节点填节点地址）';
+        tportIn.value = String(c.port);
+        protoSel.value = m[1] === 'hy2' || m[1] === 'tuic' ? 'udp' : 'tcp';
+        if (!portIn.value || portIn.value === lastAuto) {
+          var p = c.port; while (used[p] || p === 22) p++;
+          portIn.value = lastAuto = String(p);
+        }
+      }
+      landSel.addEventListener('change', function () { if (!landSel.value) { toIn.value = ''; tportIn.value = ''; } syncLand(); });
+      syncLand();
+    }, function (e) { toast(e.message, true); });
+  }
+  function pxFwdMenu(n, r, done) {
+    var bg = el('div', { class: 'sheet-bg', onclick: function (e) { if (e.target === bg) bg.remove(); } });
+    function item(t, fn, cls) { return el('button', { class: 'btn block ' + (cls || ''), style: 'margin:6px 0', text: t, onclick: function () { bg.remove(); fn(); } }); }
+    var on = r.on !== false;
+    bg.appendChild(el('div', { class: 'sheet' }, el('h2', { text: FWD_PROTO[r.proto] + ' ' + r.port + ' → ' + r.to + ':' + r.tport }),
+      item('编辑', function () { pxFwdSheet(n, r, done); }),
+      item(on ? '暂停' : '启用', function () { api('px_fwd', { id: n.id, op: 'toggle', rid: r.id }).then(function () { toast('任务已下发'); done(); }, function (e) { toast(e.message, true); }); }),
+      item('删除', function () {
+        confirmBox('删除转发', '删除「' + FWD_PROTO[r.proto] + ' ' + r.port + ' → ' + r.to + ':' + r.tport + '」？', function () {
+          return api('px_fwd', { id: n.id, op: 'del', rid: r.id }).then(function () { toast('任务已下发'); done(); });
+        });
+      }, 'danger'),
+      el('div', { class: 'acts' }, el('button', { class: 'btn', text: '取消', onclick: function () { bg.remove(); } }))));
+    document.body.appendChild(bg);
+  }
+  // 可折叠卡片：点标题行收起/展开，状态只记在内存里，关掉 App 重开就回到默认（收起）
+  var pxFoldMem = {};
+  function pxFold(key, ic, title, status, def) {
+    var folded = key in pxFoldMem ? pxFoldMem[key] : !!def;
+    var card = el('div', { class: 'card' }), body = el('div', { class: 'px-fold' });
+    var arr = el('span', { style: 'margin-left:8px;font-size:18px;line-height:1;opacity:.6;transition:transform .15s', text: '›' });
+    var hd;
+    function fset() { body.style.display = folded ? 'none' : ''; arr.style.transform = folded ? '' : 'rotate(90deg)'; if (hd) hd.style.marginBottom = folded ? '0' : ''; }
+    card.appendChild(hd = el('h3', { class: 'h3i nobar', style: 'cursor:pointer', onclick: function () {
+      folded = !folded; pxFoldMem[key] = folded; fset();
+    } }, icon(ic), el('span', { text: title }), el('span', { class: 'sp' }),
+      el('span', { class: 'hint', style: 'margin:0', text: status || '' }), arr));
+    body.style.marginTop = '8px';
+    card.appendChild(body); fset();
+    return { card: card, body: body };
+  }
+  function pxFwdCard(n, done) {
+    var f = n.fwd || { rules: [], svc: 'unknown' }, rules = f.rules || [];
+    var fo = pxFold('fwd', 'fwd', '端口转发', rules.length ? rules.length + ' 条' + (f.svc === 'active' ? '' : f.svc === 'unknown' ? '' : ' · 未生效') : '未设置', true), card = fo.body;
+    var can = n.online && !n.busy;
+    if (!rules.length) card.appendChild(el('div', { class: 'hint', style: 'margin:2px 0 10px', text: '把这台机器的某个端口转到别的服务器，做中转用。内核 DNAT 转发，不装额外工具，TCP / UDP 都行。' }));
+    rules.forEach(function (r) {
+      var off = r.on === false;
+      card.appendChild(el('div', { class: 'ssh-r' },
+        el('div', { class: 'gh-row', style: 'cursor:default' },
+          el('span', { class: 'gh-ri f' }, icon('fwd')),
+          el('span', { class: 'gh-rt' }, el('b', { text: r.port + ' → ' + r.to + ':' + r.tport + (off ? ' · 已暂停' : '') }),
+            el('small', { text: FWD_PROTO[r.proto] + (r.land ? ' · 落地：' + ((r.land.name || '') + ' ' + (r.land.t || '').toUpperCase()) : r.ip !== r.to ? ' · ' + r.ip : '') + (r.note ? ' · ' + r.note : '') }))),
+        moreBtn('更多', function () { if (!can) { toast(n.online ? '节点还有任务在执行，稍后再试' : '节点不在线', true); return; } pxFwdMenu(n, r, done); })));
+    });
+    var acts = el('div', { class: 'gh-acts' }, el('button', { class: 'btn primary', text: '添加转发', disabled: !can, onclick: function () { pxFwdSheet(n, null, done); } }));
+    if (rules.some(function (r) { return !/^\d+\.\d+\.\d+\.\d+$/.test(r.to); }))
+      acts.appendChild(el('button', { class: 'btn', text: '重新解析域名', disabled: !can, onclick: function (e) { run(e.currentTarget, function () { return api('px_fwd', { id: n.id, op: 'sync' }).then(function () { toast('任务已下发'); done(); }); }); } }));
+    card.appendChild(acts);
+    return fo.card;
   }
   function pageProxyNode(page, id) {
     page.appendChild(top('节点', true));
@@ -2750,31 +3209,46 @@
         head.appendChild(el('div', { class: 'hint', text: '节点现在连不上（服务器关机 / agent 没运行 / 网络不通）。恢复后会自动变回在线。' }));
       }
       clear(protos);
-      PX_PROTOS.forEach(function (pr) {
-        var c = n[pr[0]], card = el('div', { class: 'card' });
-        card.appendChild(el('h3', { class: 'h3i nobar' }, icon('link'), el('span', { text: pr[1] }), el('span', { class: 'sp' }),
+      var isRelay = n.kind === 'relay';
+      var nIns = PX_PROTOS.filter(function (pr) { return n[pr[0]]; }).length;
+      var pf = pxFold('protos', 'link', '协议安装', '已装 ' + nIns + ' / ' + PX_PROTOS.length, true);
+      PX_PROTOS.forEach(function (pr, i) {
+        var c = n[pr[0]], sec = el('div', { style: i ? 'border-top:1px solid var(--line);padding-top:12px;margin-top:12px' : '' });
+        sec.appendChild(el('div', { style: 'display:flex;align-items:baseline;gap:8px;margin-bottom:2px' }, el('b', { text: pr[1] }), el('span', { class: 'sp', style: 'flex:1' }),
           el('span', { class: 'hint', style: 'margin:0', text: c ? pxSvcText(c) : '未安装' })));
         if (c) {
           var info = pr[3] + ' ' + c.port + (pr[0] === 'reality' ? ' · 伪装 ' + c.sni : c.domain ? ' · 证书 ' + c.domain : ' · 自签 SNI ' + c.sni);
           if (pr[0] === 'hy2') info += (c.obfs ? ' · 混淆' : '') + (c.hop ? ' · 跳跃 ' + c.hop : '');
-          card.appendChild(el('div', { class: 'hint', style: 'margin:2px 0 10px', text: info }));
-          card.appendChild(el('div', { class: 'gh-acts' },
+          sec.appendChild(el('div', { class: 'hint', style: 'margin:2px 0 10px', text: info }));
+          sec.appendChild(el('div', { class: 'gh-acts' },
             el('button', { class: 'btn sm', text: '重新配置', disabled: !n.online || n.busy, onclick: function () { pxProtoSheet(n, pr[0], again); } }),
             el('button', { class: 'btn sm', text: '重启', disabled: !n.online || n.busy, onclick: function (e) { var b = e.currentTarget; run(b, function () { return api('px_op', { id: id, op: 'restart_' + pr[0] }).then(load); }); } }),
             el('button', { class: 'btn sm danger', text: '卸载', disabled: !n.online || n.busy, onclick: function () {
               confirmBox('卸载 ' + pr[1], '会停止服务并删除它的配置，这个节点的订阅里也不再包含它。', function () { return api('px_remove', { id: id, proto: pr[0] }).then(load); });
             } })));
         } else {
-          card.appendChild(el('div', { class: 'hint', style: 'margin:2px 0 10px', text: pr[2] }));
-          card.appendChild(el('button', { class: 'btn primary block', text: '安装 ' + pr[1], disabled: !n.online || n.busy, onclick: function () { pxProtoSheet(n, pr[0], again); } }));
+          sec.appendChild(el('div', { class: 'hint', style: 'margin:2px 0 10px', text: pr[2] }));
+          sec.appendChild(el('button', { class: 'btn primary block', text: '安装 ' + pr[1], disabled: !n.online || n.busy, onclick: function () { pxProtoSheet(n, pr[0], again); } }));
         }
-        protos.appendChild(card);
+        pf.body.appendChild(sec);
       });
+      if (!isRelay) protos.appendChild(pf.card);
+      if (isRelay || (n.fwd && n.fwd.rules && n.fwd.rules.length)) protos.appendChild(pxFwdCard(n, load));
       // 导入链接
       clear(links);
-      if (n.hy2 || n.anytls || n.tuic || n.reality) {
-        var lc = el('div', { class: 'card gh-clone' }, el('h3', { class: 'h3i nobar' }, icon('link'), el('span', { text: '导入链接' })));
-        links.appendChild(lc);
+      var hasFwd = (n.fwd && n.fwd.rules || []).some(function (r) { return r.land && r.on !== false; });
+      if (hasFwd) {
+        var ffo = pxFold('flink', 'fwd', '转发导入链接', '', true), fc = ffo.body;
+        links.appendChild(ffo.card);
+        api('px_links', { id: id }, 0).then(function (r) {
+          if (!(r.fwd || []).length) { fc.appendChild(el('div', { class: 'hint', text: '还没有可用的转发链接：落地节点要装好协议、中转机要有地址（在「⋯」里填节点地址）。' })); return; }
+          r.fwd.forEach(function (x) { fc.appendChild(pxCopyRow(x.t, x.link, x.name)); });
+          fc.appendChild(el('div', { class: 'hint', text: '地址是这台中转机，端口是转发的本机端口，其余参数和落地节点一样；点一下复制，到客户端选「从剪贴板导入」。' }));
+        }, function () {});
+      }
+      if (!isRelay && (n.hy2 || n.anytls || n.tuic || n.reality)) {
+        var lfo = pxFold('link', 'link', '导入链接', '', true), lc = lfo.body;
+        links.appendChild(lfo.card);
         api('px_links', { id: id }, 0).then(function (r) {
           if (!r.links.length) { lc.appendChild(el('div', { class: 'hint', text: '节点还没有可用地址：等它上线后会显示，或在「⋯」里手动填写节点地址。' })); return; }
           r.links.forEach(function (x) { lc.appendChild(pxCopyRow(x.t, x.link)); });
@@ -2813,6 +3287,9 @@
           }, function (e) { toast(e.message, true); });
         }),
         item('查看安装命令', function () { pxCmdSheet(n.cmd); }),
+        item(n.kind === 'relay' ? '转成落地节点（可以装协议）' : '转成入口节点', function () {
+          api('px_node_edit', { op: 'kind', id: id, kind: n.kind === 'relay' ? 'land' : 'relay' }).then(function () { toast('已转换'); again(); }, function (e) { toast(e.message, true); });
+        }),
         n.online && n.ver < n.new_ver ? item('更新节点程序', function () { api('px_op', { id: id, op: 'update' }).then(load, function (e) { toast(e.message, true); }); }) : null,
         item('重置节点密钥（旧 agent 失效）', function () {
           confirmBox('重置节点密钥', '旧的安装命令和已装的 agent 会立刻失效，需要在节点上重新执行新命令。', function () {
@@ -2820,8 +3297,8 @@
           });
         }),
         item('删除节点', function () {
-          confirmBox('删除节点', n.online ? '会让节点卸载 agent 并从列表移除；已装好的 hy2 / anytls / tuic / reality 仍在运行，不受影响。' : '节点不在线，只从列表移除。以后要卸载 agent：bash /opt/px-agent/px.sh uninstall', function () {
-            return api('px_node_edit', { op: 'del', id: id, force: !n.online }).then(function () { toast('已删除'); backHandler(); });
+          confirmBox('删除节点', n.online ? '会先把节点上装的 hy2 / anytls / tuic / reality、sing-box 和端口转发规则都卸载干净（域名证书保留），再卸载 agent，最后从列表移除。已发出去的链接会失效。' : '节点不在线，只从列表移除。以后要卸载 agent：bash /opt/px-agent/px.sh uninstall', function () {
+            return api('px_node_edit', { op: 'del', id: id, force: !n.online }).then(function (r) { toast(r && r.pending ? '已下发卸载，完成后节点会从列表消失' : '已删除'); backHandler(); });
           });
         }, 'danger'),
         el('div', { class: 'acts' }, el('button', { class: 'btn', text: '取消', onclick: function () { bg.remove(); } })));
@@ -3483,10 +3960,10 @@
     var box = el('div', { class: 'gh-md' });
     try {
       var doc = new DOMParser().parseFromString('<div>' + html + '</div>', 'text/html');
-      Array.prototype.forEach.call(doc.querySelectorAll('script,style,iframe,object,embed,form,link,meta'), function (n) { n.remove(); });
+      Array.prototype.forEach.call(doc.querySelectorAll('script,style,iframe,object,embed,form,link,meta,base,svg,math,frame,frameset,applet'), function (n) { n.remove(); });
       Array.prototype.forEach.call(doc.querySelectorAll('*'), function (n) {
         Array.prototype.slice.call(n.attributes).forEach(function (a) {
-          if (/^on/i.test(a.name) || (/^(href|src)$/i.test(a.name) && /^\s*javascript:/i.test(a.value))) n.removeAttribute(a.name);
+          if (/^on/i.test(a.name) || /^(srcdoc|formaction)$/i.test(a.name) || (/^(href|src|xlink:href|action|data)$/i.test(a.name) && /^[\s\x00-\x20]*(javascript|vbscript|data(?!:image\/(png|jpe?g|gif|webp);)):/i.test(a.value))) n.removeAttribute(a.name);
         });
         if (n.tagName === 'A') n.addEventListener('click', function (e) { var h = n.getAttribute('href'); if (h && /^https?:/i.test(h)) { e.preventDefault(); openLink(h); } else e.preventDefault(); });
       });
@@ -3705,20 +4182,43 @@
     histBtn.addEventListener('click', function () { go(gTab(), 'gitc:' + repo + '|' + path); });
     upBtn.addEventListener('click', function () { ghPickUpload(repo, path, items, null, function () { go(cur.tab, cur.sub, true); }); });
     var delBar = el('div', { class: 'gh-delbar' });
+    function ghMenu(x) {
+      var bg = el('div', { class: 'sheet-bg', onclick: function (e) { if (e.target === bg) bg.remove(); } });
+      function close() { bg.remove(); }
+      var isDir = x.type === 'dir', isFile = x.type === 'file', first = true;
+      function add(text, fn, cls) {
+        box.appendChild(el('button', { class: (cls || 'btn') + ' block', style: 'margin-top:' + (first ? 10 : 8) + 'px', text: text, onclick: function () { close(); fn(); } })); first = false;
+      }
+      var box = el('div', { class: 'sheet' }, el('h2', { text: x.name }), el('div', { class: 'hint', text: x.path }));
+      if (isDir) add('打开', function () { go(gTab(), 'gitr:' + repo + '|' + x.path); });
+      if (isFile) add('编辑', function () { ghAutoEdit = x.path; go(gTab(), 'gitf:' + repo + '|' + x.path); });
+      if (isFile) add('查看', function () { go(gTab(), 'gitf:' + repo + '|' + x.path); });
+      if (isFile) add('替换', function () { ghPickUpload(repo, path, items, x.name, function () { go(cur.tab, cur.sub, true); }); });
+      if (isDir || isFile) add('提交记录', function () { go(gTab(), 'gitc:' + repo + '|' + x.path); });
+      if (isDir || isFile) add('重命名', function () { ghRename(repo, x.path, isDir, function () { go(cur.tab, cur.sub, true); }); });
+      add('复制路径', function () { copy(x.path); });
+      add('删除', function () {
+        confirmBox(isDir ? '删除文件夹' : '删除文件', '删除「' + x.name + '」？' + (isDir ? '文件夹里的所有文件会一起删除。' : '') + '会作为一次提交记录在仓库里。', function () {
+          return api('gh_del', { repo: repo, paths: [x.path] }).then(function () { toast('已删除'); go(cur.tab, cur.sub, true); });
+        });
+      }, 'btn danger');
+      box.appendChild(el('div', { class: 'acts' }, el('button', { class: 'btn', text: '取消', onclick: close })));
+      bg.appendChild(box); document.body.appendChild(bg);
+    }
     function render() {
       clear(card);
       if (!items.length) card.appendChild(el('div', { class: 'hint', style: 'margin:6px 0', text: '这里还是空的，点「上传文件」放点东西进来。' }));
       items.forEach(function (x) {
         var chk = selMode ? el('span', { class: 'gh-chk' + (picked[x.path] ? ' on' : '') }) : null;
-        card.appendChild(el('button', { class: 'gh-row gh-f' + (picked[x.path] ? ' sel' : ''), onclick: function () {
+        var rowEl = el(selMode || x.type === 'dir' ? 'button' : 'div', { class: 'gh-row gh-f' + (picked[x.path] ? ' sel' : ''), onclick: function () {
           if (selMode) { if (picked[x.path]) delete picked[x.path]; else picked[x.path] = x; render(); return; }
           if (x.type === 'dir') go(gTab(), 'gitr:' + repo + '|' + x.path);
-          else if (x.type === 'file') go(gTab(), 'gitf:' + repo + '|' + x.path);
-          else toast(x.type === 'submodule' ? '这是子模块，不能在这里打开' : '这是链接文件，不能在这里打开');
         } }, chk,
           el('span', { class: 'gh-ri ' + (x.type === 'dir' ? 'd' : 'f') }, ghIco(x.type === 'dir' ? 'dir' : 'file')),
           el('span', { class: 'gh-rt' }, el('b', { text: x.name }), x.type === 'file' ? el('small', { text: fmtBytes(x.size) }) : null),
-          x.type === 'dir' && !selMode ? goArrow() : null));
+          x.type === 'dir' && !selMode ? goArrow() : null);
+        if (selMode) card.appendChild(rowEl);
+        else card.appendChild(el('div', { class: 'ssh-r' }, rowEl, moreBtn('更多', function () { ghMenu(x); })));
       });
       var n = Object.keys(picked).length;
       clear(delBar);
@@ -3854,6 +4354,7 @@
     page.appendChild(ghCrumbs(repo, path, true));
     var acts = el('div', { class: 'gh-acts' }); page.appendChild(acts);
     var card = el('div', { class: 'card gh-view' }, skeleton(4)); page.appendChild(card);
+    var ghAuto = ghAutoEdit === path; ghAutoEdit = '';
     // 在线编辑：改的是源码（Markdown 也是改源码），保存时作为一次提交；内容走分块上传，大文件也能存
     function ghEdit(f) {
       var crlf = /\r\n/.test(f.text), orig = f.text.replace(/\r\n/g, '\n');
@@ -3908,6 +4409,7 @@
           return api('gh_del', { repo: repo, paths: [path] }).then(function () { toast('已删除'); backHandler(); });
         });
       } }));
+      if (ghAuto && f.text != null && !f.big && !f.binary) { ghEdit(f); return; }
       if (f.img) { card.appendChild(el('div', { class: 'gh-img' }, el('img', { src: f.img, alt: name }))); return; }
       if (f.big) { card.appendChild(el('div', { class: 'hint', text: '文件太大，这里不显示内容。' })); card.appendChild(el('button', { class: 'btn sm', style: 'margin-top:10px', text: '在 GitHub 打开', onclick: function () { openLink(f.url); } })); return; }
       if (f.binary) { card.appendChild(el('div', { class: 'hint', text: '这是二进制文件，不能直接显示。' })); return; }
@@ -4322,7 +4824,19 @@
       }, 230);
     }
     reset();
+    // 小程序被切到后台 / 被系统冻结时，刷新流程里的定时器会停掉，busy 永远是 true，之后就再也下拉不动。
+    // 回到前台时强制复位；另外 busy 超过 6 秒也视为卡死，下次触摸直接放行。
+    var busySince = 0;
+    function unstick() {
+      busy = false; on = false; dy = 0; ptrRefreshTracking = false; ptrRefreshGeneration++;
+      app.style.transition = ''; app.style.transform = ''; app.style.willChange = '';
+      reset();
+    }
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) unstick(); });
+    window.addEventListener('pageshow', unstick);
+    window.addEventListener('focus', function () { if (busy && Date.now() - busySince > 6000) unstick(); });
     document.addEventListener('touchstart', function (e) {
+      if (busy && Date.now() - busySince > 6000) unstick();
       on = false; dy = 0;
       if (busy || e.touches.length !== 1 || (window.scrollY || document.documentElement.scrollTop || app.scrollTop) > 0) return;
       if (document.querySelector('.sheet-bg, .zoom') || /^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName || ''))) return;
@@ -4345,8 +4859,10 @@
       var fire = dy * .5 >= TH * .5;
       if (fire && cur) {
         showIosSpinner();
-        ind.style.transform = 'translate(-50%,10px)'; ind.style.opacity = '1';
-        busy = true; hap('ok');
+        // 刷新期间页面固定停在下拉位置，圆环在页面上方；以前靠松手前残留的位移，被系统清掉后圆环会盖在内容上
+        app.style.transition = 'transform .15s ease-out'; app.style.willChange = 'transform'; app.style.transform = 'translateY(44px)';
+        ind.style.transform = 'translate(-50%,4px)'; ind.style.opacity = '1';
+        busy = true; busySince = Date.now(); hap('ok');
         // 等本轮页面刷新请求全部结束，再额外停留 0.2 秒；隐藏指示器后 0.10 秒再回弹。
         // 每轮使用独立代号，超时后迟到的旧请求不能修改新一轮的计数。
         ptrRefreshGeneration++;
